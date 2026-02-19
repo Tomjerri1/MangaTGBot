@@ -65,11 +65,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
 
-@owner_only
+@owner_only 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = " ".join(context.args)
     if "|" not in raw:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Формат: /add Назва | URL\n"
             "Приклад: /add Моя манга | https://manga/manga/test"
         )
@@ -80,17 +80,17 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = parts[1].strip()
 
     if not title or not url.startswith("http"):
-        await update.message.reply_text("Невірний формат. Назва і URL не можуть бути порожніми.")
+        await update.effective_message.reply_text("Невірний формат. Назва і URL не можуть бути порожніми.")
         return
 
     data = load_data()
     if title in data["manga"]:
-        await update.message.reply_text(f" ! «{title}» вже є в списку.")
+        await update.effective_message.reply_text(f" ! «{title}» вже є в списку.")
         return
 
     data["manga"][title] = {"url": url, "last_chapter": "невідомо"}
     save_data(data)
-    await update.message.reply_text(f" ✓ «{title}» додано!\nURL: {url}", disable_web_page_preview=True)
+    await update.effective_message.reply_text(f" ✓ «{title}» додано!\nURL: {url}", disable_web_page_preview=True)
 
 
 @owner_only

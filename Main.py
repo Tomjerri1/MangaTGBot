@@ -1,4 +1,3 @@
-import paths
 import asyncio
 import signal
 from datetime import datetime
