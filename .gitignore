@@ -1,11 +1,8 @@
-# Секретні дані — ніколи не завантажувати на GitHub
 .env
 
-# Дані і логи
 data/data.json
 data/manga.log
 
-# Python
 __pycache__/
 *.pyc
 *.pyo
