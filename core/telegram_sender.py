@@ -7,10 +7,6 @@ _MAX_LENGTH = 4096
 
 
 def _split_text(text: str) -> list[str]:
-    """
-    Розбиває текст на частини по _MAX_LENGTH символів.
-    Розбиває тільки по переносу рядка щоб не розрізати запис манги навпіл.
-    """
     if len(text) <= _MAX_LENGTH:
         return [text]
 

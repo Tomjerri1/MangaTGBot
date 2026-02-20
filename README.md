@@ -1,38 +1,39 @@
 # Manga Tracker
 
-Автоматичний трекер нових глав манги з сповіщеннями в Telegram.
+Telegram бот який слідкує за новими главами манги. Дані зберігаються в MongoDB Atlas.
 
 ## Що робить
 
-- Щодня перевіряє нові глави для списку манг
-- Відправляє звіт в Telegram з результатами і посиланнями
-- Підтримує сайти: **com-x.life**, **mangabuff.ru**, **mangalib.me** та інші через fallback
-- Керування списком манг через Telegram бота без редагування файлів
+- Перевіряє нові глави на вимогу через Telegram
+- Відправляє звіт тільки з новими главами (без спаму)
+- Підтримує **com-x.life**, **mangabuff.ru**, **mangalib.me** та будь-які інші сайти через fallback парсер
+- Керування списком манг через Telegram
 
 ## Структура проекту
 
 ```
 manga/
 ├── core/
-│   ├── checker.py           # Логіка перевірки з файловим локом
+│   ├── __init__.py
+│   ├── checker.py           # Логіка перевірки
 │   ├── logger.py            # Централізоване логування
-│   ├── parser_playwright.py # Парсери сайтів (async + Playwright)
-│   ├── storage.py           # Робота з data.json
-│   └── telegram_sender.py   # Відправка повідомлень
+│   ├── parser_playwright.py # Парсери сайтів (Playwright + aiohttp API)
+│   ├── repository.py        # MongoDB репозиторій (Dependency Injection)
+│   └── telegram_sender.py   # Відправка повідомлень з розбивкою на частини
 ├── config/
+│   ├── __init__.py
 │   └── config.py            # Читає налаштування з .env
 ├── data/
-│   ├── data.json            # Список манг і останні глави
-│   ├── data.json.bak        # Автоматичний бекап (створюється програмою)
-│   └── manga.log            # Лог всіх запусків
+│   └── manga.log            # Лог всіх запусків (створюється автоматично)
 ├── .env                     # Токени і налаштування
-├── .env.example             # Шаблон .env для нових користувачів
-├── paths.py                 # Налаштування шляхів імпорту
-├── Main.py                  # Щоденна автоматична перевірка
-├── bot.py                   # Telegram бот для ручного керування
-├── run_silent.vbs           # Тихий запуск без вікна CMD
-├── requirements.txt         # Список залежностей
+├── .env.example
+├── .gitignore
+├── bot.py                   # Єдина точка входу
+├── README.md
+└── requirements.txt
 ```
+
+## Встановлення
 
 ### 1. Встанови залежності
 
@@ -48,66 +49,48 @@ playwright install chromium
 
 ### 3. Створи `.env` файл
 
-Скопіюй шаблон і заповни своїми даними:
-
 ```bash
 cp .env.example .env
 ```
 
-Відкрий `.env` і встав свої значення:
+Відкрий `.env` і заповни:
 
 ```env
+# Telegram
 TELEGRAM_TOKEN=твій_токен_від_BotFather
 TELEGRAM_CHAT_ID=твій_chat_id
 
-# Режим браузера: true = фоновий, false = видно вікно (для дебагу)
+# MongoDB Atlas
+MONGODB_URI=mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/
+MONGODB_DB=Manga
+MONGODB_COLLECTION=MangaTG
+
+# Браузер
 HEADLESS=true
-
-# Максимум одночасних вкладок браузера
 MAX_CONCURRENT_PAGES=10
-
-# Скидати контекст браузера кожні N манг (очищає кеш і пам'ять)
 CONTEXT_RESET_EVERY=20
-
-# Максимальний час очікування на одну мангу в секундах
 PAGE_TIMEOUT=120
 ```
-### 4. Створи `data/data.json`
 
-```json
-{
-    "last_check_date": "",
-    "manga": {
-        "Назва манги": {
-            "url": "https://com-x.life/...",
-            "last_chapter": "невідомо"
-        }
-    }
-}
-```
+### 4. Налаштуй MongoDB Atlas
 
-Або просто запусти `Main.py` — файл створюється автоматично з порожнім списком.
+1. Зареєструйся на [mongodb.com/atlas](https://www.mongodb.com/atlas)
+2. Створи безкоштовний кластер **M0**
+3. Database Access → створи користувача з роллю `readWrite`
+4. Network Access → додай `0.0.0.0/0`
+5. Connect → Drivers → скопіюй URI і встав в `.env`
 
 ---
 
 ## Запуск
 
-### Ручна перевірка
-
-```bash
-python Main.py
-```
-
-Перевіряє всі манги і відправляє звіт в Telegram.  
-Якщо перевірка вже була сьогодні — пропускає.
-
-### Telegram бот
-
 ```bash
 python bot.py
 ```
 
-#### Команди бота
+---
+
+## Команди бота
 
 | Команда | Опис |
 |---------|------|
@@ -117,91 +100,31 @@ python bot.py
 | `/remove Назва` | Видалити мангу |
 | `/check` | Перевірити всі манги прямо зараз |
 
-#### Приклади
-
+**Приклад додавання:**
 ```
-/add Моя манга | https://mangabuff.ru/manga/test
-/remove Моя манга
+/add Berserk | https://manga/manga/berserk
 ```
-
-### Автозапуск на Windows (без вікна CMD)
-
-1. Відкрий `run_silent.vbs` і перевір шлях:
-   ```vbs
-   objShell.Run "python C:\шлях\до\manga\Main.py", 0, False
-   ```
-
-2. Відкрий **Планувальник завдань** → "Створити просте завдання"
-   - Тригер: при вході в систему або щодня о потрібній годині
-   - Програма: `wscript.exe`
-   - Аргументи: `C:\шлях\до\manga\run_silent.vbs`
-   - Початкова папка: `C:\шлях\до\manga`
 
 ---
 
 ## Підтримувані сайти
 
-| Сайт | Метод парсингу | Примітка |
-|------|---------------|---------|
-| com-x.life | `window.__DATA__` через JS | З regex fallback |
-| mangabuff.ru | Посилання `/chapter/N` | З текстовим fallback |
-| mangalib.me | Прямий API запит | Без браузера, найшвидший |
-| Інші сайти | Fallback — пошук "Глава/Розділ/Chapter N" | Може не працювати на всіх |
+| Сайт | Метод |
+|------|-------|
+| `com-x.life` | `window.__DATA__` через JS + regex fallback |
+| `mangabuff.ru` | Посилання `/chapter/N` |
+| `mangalib.me` | Прямий API запит (без браузера) |
+| Будь-який інший | Fallback — пошук "Глава N" / "Розділ N" / "Chapter N" |
 
-### Додати новий сайт
+### Як додати новий сайт
 
-Відкрий `core/parser_playwright.py` і додай новий парсер:
+В `core/parser_playwright.py` додай:
 
 ```python
-#@register_parser("новий-сайт.com")
-#@retry(times=3, delay=2.0)
+@register_parser("новий-сайт.com")
+@retry(times=3, delay=2.0)
 async def _parse_новий(page, url: str) -> str:
     await page.goto(url, timeout=40000, wait_until="domcontentloaded")
     # твоя логіка парсингу
-    ...
-```
-
-Більше нічого міняти не треба — `_check_one` підхопить його автоматично.
-
----
-
-## Логування
-
-Всі події записуються в `data/manga.log`:
-
-```
-[2026-02-19 10:00:01] [manga.main] Починаємо перевірку 5 манг паралельно
-[2026-02-19 10:00:03] [manga.parser]  Перевіряємо: Три геніальні сестри 
-[2026-02-19 10:00:04] [manga.parser]   com-x.life: 199
-[2026-02-19 10:00:05] [manga.checker] Збережено результати
-```
-
-При запуску з PyCharm або терміналу — виводиться також в консоль.  
-При фоновому запуску (планувальник) — тільки у файл.
-
----
-
-## Захист даних
-
-- Токени зберігати тільки в `.env`
-- Перед кожним збереженням автоматично створюється `data.json.bak`
-- Якщо `data.json` пошкоджений - програма автоматично відновлює з бекапу
-- Бот відповідає тільки на команди від власника (перевірка по `CHAT_ID`)
-
----
-
-## Залежності
-
-```
-python-telegram-bot  — Telegram бот
-playwright           — парсинг JS сайтів через браузер
-aiohttp              — асинхронні HTTP запити (mangalib API)
-python-dotenv        — читання .env файлу
-filelock             — захист від одночасного запису
-```
-
-Встановити всі одразу:
-```bash
-pip install -r requirements.txt
-playwright install chromium
+    return "номер_глави"
 ```
