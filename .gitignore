@@ -1,9 +1,15 @@
 .env
 
 data/data.json
+data/data.json.bak
 data/manga.log
+data/manga.lock
 
 __pycache__/
 *.pyc
 *.pyo
 .venv/
+venv/
+
+.idea/
+.vscode/

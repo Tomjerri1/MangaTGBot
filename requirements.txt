@@ -1,13 +1,17 @@
+# Telegram бот
 python-telegram-bot==20.7
 
+# Парсинг сайтів через браузер
 playwright==1.40.0
 
-# HTTP запити (для mangalib API)
+# HTTP запити (для mangalib API і aiohttp сесії)
 aiohttp==3.9.1
 
+# Читання .env файлу
 python-dotenv==1.0.0
 
-filelock==3.13.1
+# MongoDB асинхронний драйвер
+motor==3.3.2
 
 # Опціонально — прихований режим якщо сайти починають блокувати
 # playwright-stealth==1.0.6

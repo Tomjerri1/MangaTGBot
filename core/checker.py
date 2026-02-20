@@ -1,71 +1,59 @@
 """
-Спільна логіка перевірки манг використовується і в Main.py і в bot.py.
-Містить файловий лок щоб уникнути одночасного запису з двох процесів.
+Спільна логіка перевірки манг.
+Використовує Dependency Injection через AbstractRepository.
 """
-import os
 from datetime import datetime
-from filelock import FileLock, Timeout
 
-from core.storage import load_data, save_data
 from core.parser_playwright import check_all
 from core.logger import get_logger
+from core.repository import AbstractRepository, get_repository
 
 log = get_logger("checker").info
 
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_LOCK_FILE = os.path.join(_BASE_DIR, "data", "manga.lock")
 
+async def run_check(repo: AbstractRepository = None) -> tuple[str, list[str]]:
+    if repo is None:
+        repo = get_repository()
 
-async def run_check() -> tuple[str, list[str]]:
-    """
-    Перевіряє всі манги і оновлює data.json.
-    Повертає (текст_звіту, список_помилок).
-    """
-    lock = FileLock(_LOCK_FILE, timeout=5)
-
-    try:
-        with lock:
-            data = load_data()
-            manga_urls = {title: info["url"] for title, info in data["manga"].items()}
-            old_chapters = {title: info["last_chapter"] for title, info in data["manga"].items()}
-
-    except Timeout:
-        log(" ! Перевірка вже виконується в іншому процесі тому пропускаємо.")
-        return " ! Перевірка вже виконується, спробуй пізніше.", []
+    data = await repo.load()
+    manga_urls = {title: info["url"] for title, info in data["manga"].items()}
+    old_chapters = {title: info["last_chapter"] for title, info in data["manga"].items()}
 
     results = await check_all(manga_urls)
 
-    try:
-        with lock:
-            fresh_data = load_data()
+    new_lines = []
+    error_lines = []
+    errors = []
 
-            report_lines = [f"Звіт за {datetime.now().strftime('%d.%m.%Y')}\n"]
-            errors = []
+    for title, new_chapter in results.items():
+        if title not in data["manga"]:
+            log(f"  ℹ️ {title} — видалена під час перевірки, пропускаємо")
+            continue
 
-            for title, new_chapter in results.items():
-                if title not in fresh_data["manga"]:
-                    log(f"  {title} - видалена під час перевірки, пропускаємо")
-                    continue
+        old_chapter = str(old_chapters.get(title, "невідомо"))
+        new_chapter = str(new_chapter) if new_chapter else new_chapter
+        url = data["manga"][title]["url"]
 
-                old_chapter = old_chapters.get(title, "невідомо")
-                url = fresh_data["manga"][title]["url"]
+        if not new_chapter or new_chapter == "невідомо":
+            error_lines.append(f"⚠️ {title} — не вдалося перевірити\n  {url}")
+            errors.append(title)
+            continue
 
-                if not new_chapter or new_chapter == "невідомо":
-                    report_lines.append(f" ! {title} - не вдалося перевірити\n  {url}")
-                    errors.append(title)
-                    continue
+        if new_chapter != old_chapter:
+            new_lines.append(f"✅ {title} — нова глава: {new_chapter}  (була: {old_chapter})\n  {url}")
+            await repo.update_chapter(title, new_chapter)
 
-                if new_chapter != old_chapter:
-                    report_lines.append(f" ✓ {title} - нова глава: {new_chapter}  (була: {old_chapter})\n  {url}")
-                    fresh_data["manga"][title]["last_chapter"] = new_chapter
-                else:
-                    report_lines.append(f" {title} - нових глав немає (остання: {old_chapter})\n  {url}")
+    await repo.set_last_check_date(datetime.now().strftime("%Y-%m-%d"))
 
-            fresh_data["last_check_date"] = datetime.now().strftime("%Y-%m-%d")
-            save_data(fresh_data)
+    report_lines = [f"📚 Звіт за {datetime.now().strftime('%d.%m.%Y')}\n"]
 
-            return "\n".join(report_lines), errors
+    if new_lines:
+        report_lines.extend(new_lines)
+    else:
+        report_lines.append("Нових глав немає.")
 
-    except Timeout:
-        log(" ! Не вдалося зберегти результати, інший процес тримає лок.")
-        return " ! Перевірка завершена але не вдалося зберегти результати.", []
+    if error_lines:
+        report_lines.append("")
+        report_lines.extend(error_lines)
+
+    return "\n".join(report_lines), errors

@@ -1,3 +1,7 @@
+"""
+Централізоване логування для всього проекту.
+Імпортуй get_logger в будь-якому файлі замість print().
+"""
 import logging
 import os
 import sys
@@ -16,7 +20,6 @@ def _setup_logger() -> logging.Logger:
 
     logger.setLevel(logging.DEBUG)
 
-    # Файловий handler завжди активний
     os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
     fh = logging.FileHandler(_LOG_PATH, encoding="utf-8")
     fh.setFormatter(logging.Formatter(
@@ -25,7 +28,6 @@ def _setup_logger() -> logging.Logger:
     ))
     logger.addHandler(fh)
 
-    # Консольний handler тільки в PyCharm або терміналі
     if VERBOSE:
         ch = logging.StreamHandler(sys.stdout)
         ch.setFormatter(logging.Formatter("%(message)s"))
@@ -34,15 +36,12 @@ def _setup_logger() -> logging.Logger:
     return logger
 
 
-# Єдиний логер для всього проекту
 logger = _setup_logger()
 
 
 def get_logger(name: str = "manga") -> logging.Logger:
-    """Повертає логер з потрібним іменем (підлогер основного)"""
     return logging.getLogger(f"manga.{name}") if name != "manga" else logger
 
 
 def log(msg: str):
-    """Швидкий виклик для основного логера"""
     logger.info(msg)
