@@ -68,7 +68,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
 
-@owner_only
+@owner_only 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = " ".join(context.args)
     if "|" not in raw:
