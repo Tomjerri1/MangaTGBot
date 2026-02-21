@@ -14,8 +14,9 @@ load_dotenv(os.path.join(_BASE_DIR, ".env"))
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_PAGES", "10"))
-CONTEXT_RESET_EVERY = int(os.getenv("CONTEXT_RESET_EVERY", "20"))
+MAX_CONCURRENT_API = int(os.getenv("MAX_CONCURRENT_API", "5"))
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "120"))
+BROWSER_BATCH_SIZE = int(os.getenv("BROWSER_BATCH_SIZE", "10"))
 
 log = get_logger("parser").info
 
@@ -42,21 +43,25 @@ def register_parser(domain: str):
         return func
     return decorator
 
+
 _CHAPTER_RE = re.compile(
     r"(?:Глава|Розділ|Chapter)\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE
 )
 
+
 def _find_last_chapter(text: str) -> float | None:
-    """
-    Знаходить номер глави в тексті.
-    Використовує max() щоб уникнути хибних спрацювань:
-    "Глава 5 (була Глава 4)" -> знайде [5, 4] -> поверне 5
-    """
     matches = _CHAPTER_RE.findall(text)
     if matches:
         return max(float(m) for m in matches)
     return None
+
+
+def _chunks(lst: list, n: int):
+    """Ділить список на батчі по n елементів"""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
 
 def retry(times: int = 3, delay: float = 2.0):
     def decorator(func):
@@ -64,12 +69,6 @@ def retry(times: int = 3, delay: float = 2.0):
             last_error = None
             for attempt in range(1, times + 1):
                 try:
-                    if attempt > 1:
-                        log(f"  🔄 Перезавантаження перед спробою {attempt}...")
-                        try:
-                            await page.reload(timeout=30000, wait_until="domcontentloaded")
-                        except Exception:
-                            await page.goto(url, timeout=40000, wait_until="domcontentloaded")
                     return await func(page, url, *args, **kwargs)
                 except Exception as e:
                     last_error = e
@@ -81,8 +80,8 @@ def retry(times: int = 3, delay: float = 2.0):
         return wrapper
     return decorator
 
+
 def _extract_comx_chapters(html: str) -> list[int]:
-    """Regex fallback для com-x.life"""
     m = re.search(r'window\.__DATA__\s*=\s*({.*?})\s*(?:;|</script>)', html, re.DOTALL)
     if not m:
         nums = re.findall(r'"posi"\s*:\s*(\d+)', html)
@@ -94,8 +93,8 @@ def _extract_comx_chapters(html: str) -> list[int]:
         nums = re.findall(r'"posi"\s*:\s*(\d+)', m.group(1))
         return [int(n) for n in nums]
 
+
 async def _extract_comx_chapters_js(page) -> list[int]:
-    """сновний спосіб для com-x.life"""
     try:
         data = await page.evaluate(
             "() => typeof window.__DATA__ !== 'undefined' ? window.__DATA__ : null"
@@ -109,7 +108,6 @@ async def _extract_comx_chapters_js(page) -> list[int]:
 
 
 async def _parse_mangalib_api(url: str, session: aiohttp.ClientSession) -> str:
-    """Асинхронний запит до API mangalib через спільну сесію"""
     m = re.search(r'/manga/([^/?#]+)', url)
     if not m:
         return "невідомо"
@@ -133,6 +131,79 @@ async def _parse_mangalib_api(url: str, session: aiohttp.ClientSession) -> str:
                 return result
     except Exception as e:
         log(f"  ❌ API помилка: {e}")
+    return "невідомо"
+
+
+
+
+async def _parse_honeymanga_api(url: str, session: aiohttp.ClientSession) -> str:
+    m = re.search(r'/book/([a-f0-9-]{36})', url)
+    if not m:
+        return "невідомо"
+    manga_id = m.group(1)
+    api_url = "https://data.api.honey-manga.com.ua/v2/chapter/cursor-list"
+    log(f"  -> API запит: {api_url}")
+    try:
+        # Спочатку отримуємо загальну кількість глав щоб знайти останню
+        async with session.post(
+            api_url,
+            json={"mangaId": manga_id, "page": 1, "pageSize": 1, "sortOrder": "DESC"},
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
+            r.raise_for_status()
+            data = await r.json()
+            items = data.get("list", []) or data.get("data", []) or data.get("items", [])
+            if not items and isinstance(data, list):
+                items = data
+            if items:
+                first = items[0]
+                # Номер глави може бути в різних полях
+                chapter = (
+                    first.get("chapterNum") or
+                    first.get("number") or
+                    first.get("chapter") or
+                    first.get("index")
+                )
+                if chapter is not None:
+                    result = str(int(float(chapter))) if float(chapter) == int(float(chapter)) else str(chapter)
+                    log(f"  ✅ honey-manga API: {result}")
+                    return result
+            log(f"  ⚠️ honey-manga API: невідома структура відповіді: {str(data)[:200]}")
+    except Exception as e:
+        log(f"  ❌ honey-manga API помилка: {e}")
+    return "невідомо"
+
+
+async def _parse_zenko_api(url: str, session: aiohttp.ClientSession) -> str:
+    m = re.search(r'/titles/(\d+)', url)
+    if not m:
+        return "невідомо"
+    title_id = m.group(1)
+    api_url = f"https://api.zenko.online/titles/{title_id}/chapters"
+    log(f"  -> API запит: {api_url}")
+    try:
+        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            r.raise_for_status()
+            data = await r.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            chapters = []
+            for item in items:
+                name = item.get("name", "")
+                # Формат: "18@#%&;№%#&**#!@151@#%&;№%#&**#!@Назва"
+                # Другий сегмент — номер глави
+                parts = name.split("@#%&;№%#&**#!@")
+                if len(parts) >= 2:
+                    try:
+                        chapters.append(float(parts[1]))
+                    except ValueError:
+                        pass
+            if chapters:
+                last = max(chapters)
+                result = str(int(last)) if last == int(last) else str(last)
+                log(f"  ✅ zenko.online API: {result}")
+                return result
+    except Exception as e:
+        log(f"  ❌ zenko.online API помилка: {e}")
     return "невідомо"
 
 @register_parser("com-x.life")
@@ -169,7 +240,6 @@ async def _parse_mangabuff(page, url: str) -> str:
         pass
 
     chapters = []
-
     links = await page.query_selector_all("a[href*='/chapter/']")
     for link in links:
         href = await link.get_attribute("href") or ""
@@ -208,6 +278,8 @@ async def _parse_fallback(page, url: str) -> str:
     links = await page.query_selector_all("a")
     for link in links:
         text = (await link.inner_text()).strip()
+        if len(text) > 80:
+            continue
         num = _find_last_chapter(text)
         if num is not None:
             chapters.append(num)
@@ -219,54 +291,41 @@ async def _parse_fallback(page, url: str) -> str:
         return result
     raise Exception(f"главу не знайдено ({url})")
 
-
-class _BrowserState:
-    def __init__(self, context):
-        self.context = context
-        self.count = 0
-
-    async def rotate_if_needed(self, browser):
-        self.count += 1
-        if self.count % CONTEXT_RESET_EVERY == 0:
-            log(f"  🔄 Скидаємо контекст браузера (перевірено {self.count} манг)...")
-            old = self.context
-            self.context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 800},
-                locale="ru-RU",
-            )
-            await old.close()
-
-
 async def _check_one(
     semaphore: asyncio.Semaphore,
-    browser,
-    state: "_BrowserState | None",
+    context,
     session: aiohttp.ClientSession,
     title: str,
     url: str
 ) -> tuple[str, str]:
     log(f"\n=== Перевіряємо: {title} ===")
 
-    # Mangalib через API без браузера, семафор не потрібен
     if "mangalib.me" in url:
         result = await _parse_mangalib_api(url, session)
         if result == "невідомо":
             log(f"  ⚠️ mangalib: главу не знайдено")
         return title, result
 
-    #щоб не зависнути назавжди
+    if "honey-manga.com.ua" in url:
+        result = await _parse_honeymanga_api(url, session)
+        if result == "невідомо":
+            log(f"  ⚠️ honey-manga API: главу не знайдено")
+        return title, result
+
+    if "zenko.online" in url:
+        result = await _parse_zenko_api(url, session)
+        if result == "невідомо":
+            log(f"  ⚠️ zenko.online API: главу не знайдено")
+        return title, result
+
+    if context is None:
+        log(f"  ❌ {title} — context не передано")
+        return title, "невідомо"
+
     try:
-        result = await asyncio.wait_for(
-            _check_one_browser(semaphore, browser, state, title, url),
-            timeout=PAGE_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        log(f"  ❌ {title} — перевищено ліміт часу {PAGE_TIMEOUT}с")
+        result = await _check_one_browser(semaphore, context, title, url)
+    except Exception as e:
+        log(f"  ❌ {title} — помилка: {e}")
         result = "невідомо"
 
     return title, result
@@ -274,24 +333,27 @@ async def _check_one(
 
 async def _check_one_browser(
     semaphore: asyncio.Semaphore,
-    browser,
-    state: _BrowserState,
+    context,
     title: str,
     url: str
 ) -> str:
     async with semaphore:
-        await state.rotate_if_needed(browser)
-        context = state.context
         page = await context.new_page()
 
+        page.set_default_navigation_timeout(PAGE_TIMEOUT * 1000)
+        page.set_default_timeout(PAGE_TIMEOUT * 1000)
+
         async def block_resources(route):
-            if route.request.resource_type in BLOCKED_RESOURCES:
-                await route.abort()
-                return
-            if any(domain in route.request.url for domain in BLOCKED_DOMAINS):
-                await route.abort()
-                return
-            await route.continue_()
+            try:
+                if route.request.resource_type in BLOCKED_RESOURCES:
+                    await route.abort()
+                    return
+                if any(domain in route.request.url for domain in BLOCKED_DOMAINS):
+                    await route.abort()
+                    return
+                await route.continue_()
+            except Exception:
+                pass
         await page.route("**/*", block_resources)
 
         try:
@@ -307,51 +369,76 @@ async def _check_one_browser(
             await page.close()
 
 
+async def _run_browser_batch(
+    semaphore: asyncio.Semaphore,
+    session: aiohttp.ClientSession,
+    batch: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-extensions",
+                "--disable-plugins",
+            ]
+        )
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="ru-RU",
+        )
+        try:
+            tasks = [
+                _check_one(semaphore, context, session, title, url)
+                for title, url in batch
+            ]
+            return list(await asyncio.gather(*tasks))
+        finally:
+            await context.close()
+            await browser.close()
+
+
 async def check_all(manga_dict: dict) -> dict[str, str]:
     log(f"Починаємо перевірку {len(manga_dict)} манг паралельно (макс. {MAX_CONCURRENT} одночасно)...")
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-    api_manga = {t: u for t, u in manga_dict.items() if "mangalib.me" in u}
-    browser_manga = {t: u for t, u in manga_dict.items() if "mangalib.me" not in u}
+    API_DOMAINS = {"mangalib.me", "honey-manga.com.ua", "zenko.online"}
+    api_manga = {t: u for t, u in manga_dict.items() if any(d in u for d in API_DOMAINS)}
+    browser_manga = list({t: u for t, u in manga_dict.items() if not any(d in u for d in API_DOMAINS)}.items())
 
     async with aiohttp.ClientSession(headers=API_HEADERS) as session:
 
         async def run_api():
             if not api_manga:
                 return []
-            tasks = [
-                _check_one(semaphore, None, None, session, title, url)
-                for title, url in api_manga.items()
-            ]
+            api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_API)
+
+            async def _limited(title, url):
+                async with api_semaphore:
+                    return await _check_one(semaphore, None, session, title, url)
+
+            tasks = [_limited(title, url) for title, url in api_manga.items()]
             return await asyncio.gather(*tasks)
 
         async def run_browser():
             if not browser_manga:
                 return []
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=HEADLESS,
-                    args=["--disable-gpu", "--disable-dev-shm-usage"]
-                )
-                context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 800},
-                    locale="ru-RU",
-                )
-                state = _BrowserState(context)
-                tasks = [
-                    _check_one(semaphore, browser, state, session, title, url)
-                    for title, url in browser_manga.items()
-                ]
-                results = await asyncio.gather(*tasks)
-                await state.context.close()
-                await browser.close()
-                return results
+            results = []
+            batches = list(_chunks(browser_manga, BROWSER_BATCH_SIZE))
+            log(f"Браузерні манги: {len(browser_manga)} шт., батчів: {len(batches)} по {BROWSER_BATCH_SIZE}")
+            for i, batch in enumerate(batches, 1):
+                log(f"  Батч {i}/{len(batches)} ({len(batch)} манг)...")
+                batch_results = await _run_browser_batch(semaphore, session, batch)
+                results.extend(batch_results)
+            return results
 
         api_results, browser_results = await asyncio.gather(run_api(), run_browser())
 
-    return dict(list(api_results) + list(browser_results))
+    return dict(api_results + browser_results)

@@ -6,14 +6,12 @@ from datetime import datetime
 
 from core.parser_playwright import check_all
 from core.logger import get_logger
-from core.repository import AbstractRepository, get_repository
+from core.repository import AbstractRepository
 
 log = get_logger("checker").info
 
 
-async def run_check(repo: AbstractRepository = None) -> tuple[str, list[str]]:
-    if repo is None:
-        repo = get_repository()
+async def run_check(repo: AbstractRepository) -> tuple[str, list[str]]:
 
     data = await repo.load()
     manga_urls = {title: info["url"] for title, info in data["manga"].items()}
@@ -31,10 +29,10 @@ async def run_check(repo: AbstractRepository = None) -> tuple[str, list[str]]:
             continue
 
         old_chapter = str(old_chapters.get(title, "невідомо"))
-        new_chapter = str(new_chapter) if new_chapter else new_chapter
+        new_chapter = str(new_chapter) if new_chapter else "невідомо"
         url = data["manga"][title]["url"]
 
-        if not new_chapter or new_chapter == "невідомо":
+        if new_chapter == "невідомо":
             error_lines.append(f"⚠️ {title} — не вдалося перевірити\n  {url}")
             errors.append(title)
             continue
