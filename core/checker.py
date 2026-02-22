@@ -11,9 +11,9 @@ from core.repository import AbstractRepository
 log = get_logger("checker").info
 
 
-async def run_check(repo: AbstractRepository) -> tuple[str, list[str]]:
-
-    data = await repo.load()
+async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None) -> tuple[str, list[str]]:
+    # Якщо дані вже завантажені (наприклад з bot.py) не робимо зайвий запит до MongoDB
+    data = preloaded_data if preloaded_data is not None else await repo.load()
     manga_urls = {title: info["url"] for title, info in data["manga"].items()}
     old_chapters = {title: info["last_chapter"] for title, info in data["manga"].items()}
 
