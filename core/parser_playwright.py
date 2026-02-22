@@ -156,6 +156,7 @@ async def _parse_honeymanga_api(url: str, session: aiohttp.ClientSession) -> str
             if not items and isinstance(data, list):
                 items = data
             if items:
+                # DESC порядок перший елемент найновіший
                 first = items[0]
                 # Номер глави може бути в різних полях
                 chapter = (
@@ -190,7 +191,7 @@ async def _parse_zenko_api(url: str, session: aiohttp.ClientSession) -> str:
             for item in items:
                 name = item.get("name", "")
                 # Формат: "18@#%&;№%#&**#!@151@#%&;№%#&**#!@Назва"
-                # Другий сегмент — номер глави
+                # Другий сегмент номер глави
                 parts = name.split("@#%&;№%#&**#!@")
                 if len(parts) >= 2:
                     try:
@@ -204,6 +205,80 @@ async def _parse_zenko_api(url: str, session: aiohttp.ClientSession) -> str:
                 return result
     except Exception as e:
         log(f"  ❌ zenko.online API помилка: {e}")
+    return "невідомо"
+
+
+
+_MANGAINUA_HEADERS = {
+    "User-Agent": API_HEADERS["User-Agent"],
+    "Accept-Language": "uk-UA,uk;q=0.9",
+}
+
+
+async def _parse_mangainua_api(url: str, session: aiohttp.ClientSession) -> str:
+    m = re.search(r'/mangas/([^/]+)/(\d+)-', url)
+    if not m:
+        return "невідомо"
+    news_category_slug = m.group(1)
+    news_id = m.group(2)
+    log(f"  -> HTTP двокроковий запит: manga.in.ua (id={news_id})")
+    try:
+        # 1. отримуємо сторінку з браузерними заголовками, витягуємо hash і cookies
+        async with session.get(
+            url,
+            headers={**_MANGAINUA_HEADERS, "Accept": "text/html"},
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
+            r.raise_for_status()
+            html = await r.text()
+            hash_match = re.search(
+                r"site_login_hash\s*=\s*['""]([a-f0-9]{32,64})['""]", html
+            )
+            if not hash_match:
+                log(f"  ⚠️ manga.in.ua: site_login_hash не знайдено")
+                return "невідомо"
+            site_login_hash = hash_match.group(1)
+
+        # 2. POST load_chapters — cookies з попереднього запиту вже в session
+        async with session.post(
+            "https://manga.in.ua/engine/ajax/controller.php",
+            data={
+                "mod": "load_chapters",
+                "action": "show",
+                "news_id": news_id,
+                "news_category": news_category_slug,
+                "this_link": url,
+                "user_hash": site_login_hash,
+            },
+            headers={
+                **_MANGAINUA_HEADERS,
+                "Referer": url,
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/javascript, */*",
+            },
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
+            r.raise_for_status()
+            body = await r.text()
+            if not body.strip():
+                log(f"  ⚠️ manga.in.ua: порожня відповідь")
+                return "невідомо"
+
+            chapters = re.findall(r'manga-chappter="(\d+(?:\.\d+)?)"', body)
+            if not chapters:
+                chapters = re.findall(r"manga-chappter='(\d+(?:\.\d+)?)'", body)
+            if not chapters:
+                chapters = re.findall(
+                    r"(?:Глава|Розділ|Chapter)\s*(\d+(?:\.\d+)?)", body, re.IGNORECASE
+                )
+            if chapters:
+                last = max(float(n) for n in chapters)
+                result = str(int(last)) if last == int(last) else str(last)
+                log(f"  ✅ manga.in.ua: {result}")
+                return result
+
+    except Exception as e:
+        log(f"  ❌ manga.in.ua помилка: {e}")
     return "невідомо"
 
 @register_parser("com-x.life")
@@ -291,6 +366,7 @@ async def _parse_fallback(page, url: str) -> str:
         return result
     raise Exception(f"главу не знайдено ({url})")
 
+
 async def _check_one(
     semaphore: asyncio.Semaphore,
     context,
@@ -316,6 +392,12 @@ async def _check_one(
         result = await _parse_zenko_api(url, session)
         if result == "невідомо":
             log(f"  ⚠️ zenko.online API: главу не знайдено")
+        return title, result
+
+    if "manga.in.ua" in url:
+        result = await _parse_mangainua_api(url, session)
+        if result == "невідомо":
+            log(f"  ⚠️ manga.in.ua: главу не знайдено")
         return title, result
 
     if context is None:
@@ -374,6 +456,7 @@ async def _run_browser_batch(
     session: aiohttp.ClientSession,
     batch: list[tuple[str, str]]
 ) -> list[tuple[str, str]]:
+    """Запускає один браузер для батчу манг, закриває після завершення"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
@@ -392,7 +475,7 @@ async def _run_browser_batch(
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 800},
-            locale="ru-RU",
+            locale="uk-UA",
         )
         try:
             tasks = [
@@ -409,7 +492,7 @@ async def check_all(manga_dict: dict) -> dict[str, str]:
     log(f"Починаємо перевірку {len(manga_dict)} манг паралельно (макс. {MAX_CONCURRENT} одночасно)...")
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-    API_DOMAINS = {"mangalib.me", "honey-manga.com.ua", "zenko.online"}
+    API_DOMAINS = {"mangalib.me", "honey-manga.com.ua", "zenko.online", "manga.in.ua"}
     api_manga = {t: u for t, u in manga_dict.items() if any(d in u for d in API_DOMAINS)}
     browser_manga = list({t: u for t, u in manga_dict.items() if not any(d in u for d in API_DOMAINS)}.items())
 
