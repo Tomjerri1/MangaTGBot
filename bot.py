@@ -1,19 +1,21 @@
 """
-Manga Tracker Bot — єдина точка входу.
+Manga Tracker Bot
 
 Команди:
-  /start  — меню
-  /cancel — скасувати поточну дію
+  /start  - меню
+  /cancel - скасувати поточну дію
 """
 
 import sys
 import os
 import signal
 import warnings
+import functools
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
+from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ConversationHandler, ContextTypes, filters, InlineQueryHandler
@@ -33,35 +35,54 @@ log = get_logger("bot").info
 
 UNKNOWN_MSG = "Вибач але не можу зрозуміти твого запиту, виклич команду /start для початку роботи."
 
+# TTL кеш для inline пошуку щоб не бити MongoDB на кожен символ
+_MANGA_CACHE: dict = {"data": {}, "updated_at": 0.0}
+_CACHE_TTL = 60  # секунд
+
+
+async def _get_cached_manga(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Повертає список манг з кешу, або завантажує з MongoDB якщо кеш застарів."""
+    now = time.time()
+    if now - _MANGA_CACHE["updated_at"] > _CACHE_TTL:
+        repo: AbstractRepository = context.bot_data["repo"]
+        data = await repo.load()
+        _MANGA_CACHE["data"] = data.get("manga", {})
+        _MANGA_CACHE["updated_at"] = now
+    return _MANGA_CACHE["data"]
+
+
+def _invalidate_manga_cache():
+    """Примусово скидає кеш — викликати після додавання або видалення манги."""
+    _MANGA_CACHE["updated_at"] = 0.0
+
+
 # Стани діалогів
 ADD_TITLE, ADD_URL = range(2)
 REMOVE_SEARCH, REMOVE_CONFIRM = range(2, 4)
 
+def _make_owner_guard(conv: bool):
+    """Фабрика декораторів захисту від сторонніх.
+    conv=False - для звичайних хендлерів (повертає None).
+    conv=True  - для ConversationHandler entry_points (повертає END)."""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if str(update.effective_user.id) != str(CHAT_ID):
+                if update.callback_query:
+                    await update.callback_query.answer("⛔ Немає доступу.", show_alert=True)
+                else:
+                    await update.effective_message.reply_text("⛔ Немає доступу.")
+                return ConversationHandler.END if conv else None
+            return await func(update, context)
+        return wrapper
+    return decorator
 
-def owner_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if str(update.effective_user.id) != str(CHAT_ID):
-            if update.callback_query:
-                await update.callback_query.answer("⛔ Немає доступу.", show_alert=True)
-            else:
-                await update.effective_message.reply_text("⛔ Немає доступу.")
-            return None
-        return await func(update, context)
-    return wrapper
 
+# Для звичайних хендлерів повертає None при відмові
+owner_only = _make_owner_guard(conv=False)
 
-def owner_only_conv(func):
-    """owner_only для ConversationHandler entry_points — повертає ConversationHandler.END"""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if str(update.effective_user.id) != str(CHAT_ID):
-            if update.callback_query:
-                await update.callback_query.answer("⛔ Немає доступу.", show_alert=True)
-            else:
-                await update.effective_message.reply_text("⛔ Немає доступу.")
-            return ConversationHandler.END
-        return await func(update, context)
-    return wrapper
-
+# Для entry_points ConversationHandler повертає END при відмові
+owner_only_conv = _make_owner_guard(conv=True)
 
 @owner_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -81,9 +102,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-
 PAGE_SIZE = 10
-
 
 def _build_status_page(manga: dict, last_check: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
     items = list(manga.items())
@@ -121,7 +140,7 @@ def _build_status_page(manga: dict, last_check: str, page: int) -> tuple[str, In
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-async def _show_status(message, context: ContextTypes.DEFAULT_TYPE):
+async def _show_status(message: Message, context: ContextTypes.DEFAULT_TYPE):
     repo: AbstractRepository = context.bot_data["repo"]
     data = await repo.load()
     manga = data.get("manga", {})
@@ -150,21 +169,26 @@ async def cb_start_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await _show_status(update.effective_message, context)
 
-
-async def _run_check_command(message, context: ContextTypes.DEFAULT_TYPE):
-    repo: AbstractRepository = context.bot_data["repo"]
-    # Завантажуємо дані один раз — передаємо в run_check щоб уникнути подвійного запиту
-    data = await repo.load()
-    manga = data.get("manga", {})
-    if not manga:
-        await message.reply_text("Список манг порожній.")
+async def _run_check_command(message: Message, context: ContextTypes.DEFAULT_TYPE):
+    # Захист від паралельного запуску — якщо перевірка вже йде, ігноруємо
+    if context.bot_data.get("check_running"):
+        await message.reply_text("⏳ Перевірка вже виконується, зачекай...")
         return
-    await message.reply_text(f"🔍 Перевіряю {len(manga)} манг, зачекай...")
-    report_text, errors = await run_check(repo=repo, preloaded_data=data)
-    await message.reply_text(report_text, disable_web_page_preview=True)
-    if errors:
-        error_text = "🚨 Не вдалося перевірити:\n" + "\n".join(f"  • {t}" for t in errors)
-        await message.reply_text(error_text)
+    context.bot_data["check_running"] = True
+    try:
+        repo: AbstractRepository = context.bot_data["repo"]
+        # Завантажуємо дані один раз передаємо в run_check щоб уникнути подвійного запиту
+        data = await repo.load()
+        manga = data.get("manga", {})
+        if not manga:
+            await message.reply_text("Список манг порожній.")
+            return
+        await message.reply_text(f"🔍 Перевіряю {len(manga)} манг, зачекай...")
+        report_text = await run_check(repo=repo, preloaded_data=data)
+        _invalidate_manga_cache()
+        await message.reply_text(report_text, disable_web_page_preview=True)
+    finally:
+        context.bot_data["check_running"] = False
 
 
 @owner_only
@@ -198,13 +222,23 @@ async def add_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.effective_message.text.strip()
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await update.effective_message.reply_text(
+            "⚠️ Невірний URL. Посилання має починатись з http:// або https://\n"
+            "Введи URL ще раз або /cancel:"
+        )
+        return ADD_URL
+
     title = context.user_data.pop("add_title", None)
     if not title:
         return ConversationHandler.END
     repo: AbstractRepository = context.bot_data["repo"]
     await repo.add_manga(title, url)
+    _invalidate_manga_cache()
     await update.effective_message.reply_text(f"✅ «{title}» додано!")
     return ConversationHandler.END
+
 
 @owner_only_conv
 async def cb_start_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -258,8 +292,16 @@ def _confirm_keyboard() -> InlineKeyboardMarkup:
 
 
 async def remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вибір манги з нумерованого списку. Викликається тільки якщо знайдено > 1 результат."""
     text = update.effective_message.text.strip()
     matches = context.user_data.get("remove_matches", [])
+
+    # Якщо matches порожній - значить чекаємо натискання кнопки ✅/❌, а не тексту
+    if not matches:
+        await update.effective_message.reply_text(
+            "⚠️ Натисни кнопку ✅ Так або ❌ Ні, або /cancel для скасування:"
+        )
+        return REMOVE_CONFIRM
 
     if not text.isdigit():
         await update.effective_message.reply_text("⚠️ Введи номер зі списку або /cancel:")
@@ -291,6 +333,7 @@ async def cb_remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "yes" and pending:
         repo: AbstractRepository = context.bot_data["repo"]
         await repo.remove_manga(pending)
+        _invalidate_manga_cache()
         await query.edit_message_text(f"🗑 «{pending}» видалено зі списку.")
     else:
         await query.edit_message_text("Скасовано.")
@@ -316,6 +359,7 @@ async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await update.effective_message.reply_text(UNKNOWN_MSG)
 
+
 async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query
     if str(query.from_user.id) != str(CHAT_ID):
@@ -323,9 +367,7 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query_text = (query.query or "").strip().lower()
-    repo: AbstractRepository = context.bot_data["repo"]
-    data = await repo.load()
-    manga = data.get("manga", {})
+    manga = await _get_cached_manga(context)
 
     matches = {t: info for t, info in manga.items() if query_text in t.lower()} if query_text else manga
 
@@ -346,6 +388,8 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await query.answer(results, cache_time=0, is_personal=True)
+
+
 
 def _handle_signal(sig, frame):
     log(f"⚠️ Отримано сигнал {sig} — завершуємо бота...")
