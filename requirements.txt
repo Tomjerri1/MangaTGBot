@@ -1,14 +1,14 @@
 # Telegram бот
-python-telegram-bot==20.7
+python-telegram-bot==21.9
 
 # Парсинг сайтів через браузер
-playwright==1.40.0
+playwright==1.50.0
 
 # HTTP запити (для API парсерів без браузера)
-aiohttp==3.9.1
+aiohttp==3.11.11
 
 # Читання .env файлу
-python-dotenv==1.0.0
+python-dotenv==1.0.1
 
 # MongoDB асинхронний драйвер
-motor==3.3.2
+motor==3.7.0

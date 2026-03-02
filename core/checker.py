@@ -11,7 +11,7 @@ from core.repository import AbstractRepository
 log = get_logger("checker").info
 
 
-async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None) -> tuple[str, list[str]]:
+async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None) -> str:
     # Якщо дані вже завантажені (наприклад з bot.py) не робимо зайвий запит до MongoDB
     data = preloaded_data if preloaded_data is not None else await repo.load()
     manga_urls = {title: info["url"] for title, info in data["manga"].items()}
@@ -21,20 +21,18 @@ async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None
 
     new_lines = []
     error_lines = []
-    errors = []
 
     for title, new_chapter in results.items():
         if title not in data["manga"]:
             log(f"  ℹ️ {title} — видалена під час перевірки, пропускаємо")
             continue
 
-        old_chapter = str(old_chapters.get(title, "невідомо"))
-        new_chapter = str(new_chapter) if new_chapter else "невідомо"
+        old_chapter = old_chapters.get(title, "невідомо")
+        new_chapter = new_chapter or "невідомо"
         url = data["manga"][title]["url"]
 
         if new_chapter == "невідомо":
             error_lines.append(f"⚠️ {title} — не вдалося перевірити\n  {url}")
-            errors.append(title)
             continue
 
         if new_chapter != old_chapter:
@@ -54,4 +52,4 @@ async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None
         report_lines.append("")
         report_lines.extend(error_lines)
 
-    return "\n".join(report_lines), errors
+    return "\n".join(report_lines)

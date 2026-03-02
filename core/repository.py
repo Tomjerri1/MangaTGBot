@@ -13,6 +13,7 @@
 import os
 from abc import ABC, abstractmethod
 from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(_BASE_DIR, ".env"))
@@ -43,6 +44,7 @@ class AbstractRepository(ABC):
     async def set_last_check_date(self, date: str) -> None:
         pass
 
+
 class MongoRepository(AbstractRepository):
     """
     MongoDB Atlas для продакшну на сервері.
@@ -52,7 +54,6 @@ class MongoRepository(AbstractRepository):
 
     def __init__(self, uri: str, db_name: str, user_id: str,
                  manga_col: str = "manga", meta_col: str = "meta"):
-        from motor.motor_asyncio import AsyncIOMotorClient
         self.client = AsyncIOMotorClient(
             uri,
             serverSelectionTimeoutMS=10000,
@@ -113,7 +114,8 @@ class MongoRepository(AbstractRepository):
             upsert=True
         )
 
-def get_repository(user_id: str = None) -> AbstractRepository:
+
+def get_repository(user_id: str | None = None) -> AbstractRepository:
     uri = os.getenv("MONGODB_URI")
     if not uri:
         raise ValueError("MONGODB_URI не вказано в .env")
