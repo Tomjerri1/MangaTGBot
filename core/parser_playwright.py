@@ -28,7 +28,6 @@ API_HEADERS = {
     "Accept": "application/json",
 }
 
-# Браузерні заголовки для manga.in.ua не API, потребує Accept-Language
 MANGAINUA_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept-Language": "uk-UA,uk;q=0.9",
@@ -37,15 +36,27 @@ MANGAINUA_HEADERS = {
 BLOCKED_RESOURCES = {"image", "media", "font", "stylesheet"}
 
 BLOCKED_DOMAINS = {
+    # Аналітика і трекінг
     "google-analytics.com", "googletagmanager.com",
+    "hotjar.com", "clarity.ms",
+    "mixpanel.com", "amplitude.com",
+    "segment.com", "fullstory.com",
+    # Реклама
     "googlesyndication.com", "doubleclick.net",
+    "adnxs.com", "pubmatic.com",
+    "rubiconproject.com", "openx.net", "criteo.com",
+    # Соцмережі і чати
     "disqus.com", "disquscdn.com",
-    "facebook.net", "mc.yandex.ru",
+    "facebook.net", "twitter.com",
+    "instagram.com", "tiktok.com",
+    "intercom.io", "zendesk.com",
+    "freshchat.com", "jivosite.com",
+    # Моніторинг і інфраструктура
+    "cloudflareinsights.com", "sentry.io", "nr-data.net",
 }
 
 SITE_PARSERS = {}
 
-# Домени що використовують HTTP API замість Playwright
 API_DOMAINS = {"mangalib.me", "honey-manga.com.ua", "zenko.online", "manga.in.ua"}
 
 
@@ -55,6 +66,8 @@ def register_parser(domain: str):
         return func
     return decorator
 
+
+#Regex
 
 _CHAPTER_RE = re.compile(
     r"(?:Глава|Розділ|Chapter)\s*(\d+(?:\.\d+)?)",
@@ -75,6 +88,8 @@ def _chunks(lst: list, n: int):
         yield lst[i:i + n]
 
 
+#Retry декоратор
+
 def retry(times: int = 3, delay: float = 2.0):
     def decorator(func):
         @functools.wraps(func)
@@ -93,6 +108,8 @@ def retry(times: int = 3, delay: float = 2.0):
         return wrapper
     return decorator
 
+
+#Допоміжні функції
 
 def _extract_comx_chapters(html: str) -> list[int]:
     m = re.search(r'window\.__DATA__\s*=\s*({.*?})\s*(?:;|</script>)', html, re.DOTALL)
@@ -204,7 +221,7 @@ async def _parse_zenko_api(url: str, session: aiohttp.ClientSession) -> str | No
             for item in items:
                 name = item.get("name", "")
                 # Формат: "18@#%&;№%#&**#!@151@#%&;№%#&**#!@Назва"
-                # Другий сегмент номер глави
+                # Другий сегмент - номер глави
                 parts = name.split("@#%&;№%#&**#!@")
                 if len(parts) >= 2:
                     try:
@@ -222,7 +239,7 @@ async def _parse_zenko_api(url: str, session: aiohttp.ClientSession) -> str | No
 
 
 
-async def _parse_mangainua_api(url: str, _session: aiohttp.ClientSession) -> str | None:
+async def _parse_mangainua_api(url: str, session: aiohttp.ClientSession) -> str | None:
     # URL: https://manga.in.ua/mangas/{category}/{id}-{slug}.html
     m = re.search(r'/mangas/([^/]+)/(\d+)-', url)
     if not m:
@@ -237,7 +254,7 @@ async def _parse_mangainua_api(url: str, _session: aiohttp.ClientSession) -> str
         cookie_jar=aiohttp.CookieJar(),
     ) as manga_session:
         try:
-            # Крок 1: отримуємо сторінку, витягуємо hash - cookies зберігаються в manga_session
+            #отримуємо сторінку, витягуємо hash - cookies зберігаються в manga_session
             async with manga_session.get(
                 url,
                 headers={"Accept": "text/html"},
@@ -254,7 +271,7 @@ async def _parse_mangainua_api(url: str, _session: aiohttp.ClientSession) -> str
                     return None
                 site_login_hash = hash_match.group(1)
 
-            # Крок 2: POST load_chapters - cookies з кроку 1 вже в manga_session
+            #POST load_chapters - cookies з кроку 1 вже в manga_session
             async with manga_session.post(
                 "https://manga.in.ua/engine/ajax/controller.php",
                 data={
@@ -294,6 +311,8 @@ async def _parse_mangainua_api(url: str, _session: aiohttp.ClientSession) -> str
         except Exception as e:
             log(f"  ❌ manga.in.ua помилка: {e}")
     return None
+
+#Парсери сайтів
 
 @register_parser("com-x.life")
 @retry(times=3, delay=2.0)
@@ -350,6 +369,33 @@ async def _parse_mangabuff(page, url: str) -> str:
         log(f"  ✅ mangabuff.ru: {result}")
         return result
     raise Exception("главу не знайдено")
+
+
+@register_parser("mangalib.me")
+@retry(times=3, delay=2.0)
+async def _parse_mangalib_browser(page: Page, url: str) -> str:
+    """Браузерний парсер для mangalib.me fallback коли API недоступний.
+    Відкриває сторінку /chapters і чекає завантаження списку глав."""
+    await page.goto(url, timeout=40000, wait_until="networkidle")
+    try:
+        await page.wait_for_selector("a[href*='/read/']", timeout=20000)
+    except Exception:
+        pass
+
+    chapters = []
+    links = await page.query_selector_all("a[href*='/read/']")
+    for link in links:
+        text = (await link.inner_text()).strip()
+        m = re.search(r"[Гг]лава\s+(\d+(?:\.\d+)?)", text)
+        if m:
+            chapters.append(float(m.group(1)))
+
+    if chapters:
+        last = max(chapters)
+        result = str(int(last)) if last == int(last) else str(last)
+        log(f"  ✅ mangalib.me (browser): {result}")
+        return result
+    raise Exception(f"главу не знайдено ({url})")
 
 
 @retry(times=3, delay=2.0)
@@ -461,9 +507,11 @@ async def _check_one_browser(
 async def _run_browser_batch(
     semaphore: asyncio.Semaphore,
     session: aiohttp.ClientSession,
-    batch: list[tuple[str, str]]
+    batch: list[tuple[str, str]],
+    fallback_batch: list[tuple[str, str]] | None = None,
 ) -> list[tuple[str, str]]:
-    """Запускає один браузер для батчу манг, закриває після завершення"""
+    """Запускає один браузер для батчу манг, закриває після завершення.
+    fallback_batch - додаткові API манги для яких треба спробувати браузер."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
@@ -473,22 +521,43 @@ async def _run_browser_batch(
                 "--no-sandbox",
                 "--disable-extensions",
                 "--disable-plugins",
+                "--disable-blink-features=AutomationControlled",
             ]
         )
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1280, "height": 800},
             locale="uk-UA",
+            extra_http_headers={"Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7"},
         )
+        # Приховати ознаки headless браузера
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+            window.chrome = {runtime: {}};
+        """)
         try:
             tasks = [
                 _check_one(semaphore, context, session, title, url)
                 for title, url in batch
             ]
-            return list(await asyncio.gather(*tasks))
+            results = list(await asyncio.gather(*tasks))
+
+            # Fallback для API манг що повернули "невідомо"
+            if fallback_batch:
+                log(f"  Браузерний fallback для {len(fallback_batch)} API манг...")
+                fallback_tasks = [
+                    _check_one_browser(semaphore, context, title, url)
+                    for title, url in fallback_batch
+                ]
+                fallback_results = await asyncio.gather(*fallback_tasks)
+                results.extend(zip([t for t, _ in fallback_batch], fallback_results))
+
+            return results
         finally:
             await context.close()
             await browser.close()
+
 
 
 async def check_all(manga_dict: dict) -> dict[str, str]:
@@ -500,7 +569,7 @@ async def check_all(manga_dict: dict) -> dict[str, str]:
 
     async with aiohttp.ClientSession(headers=API_HEADERS) as session:
 
-        async def run_api():
+        async def run_api() -> list[tuple[str, str]]:
             if not api_manga:
                 return []
             api_semaphore = asyncio.Semaphore(MAX_CONCURRENT_API)
@@ -510,20 +579,49 @@ async def check_all(manga_dict: dict) -> dict[str, str]:
                     return await _check_one(semaphore, None, session, title, url)
 
             tasks = [_limited(title, url) for title, url in api_manga.items()]
-            return await asyncio.gather(*tasks)
+            return list(await asyncio.gather(*tasks))
 
-        async def run_browser():
-            if not browser_manga:
+        async def run_browser(fallback: list[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
+            if not browser_manga and not fallback:
                 return []
             results = []
-            batches = list(_chunks(browser_manga, BROWSER_BATCH_SIZE))
-            log(f"Браузерні манги: {len(browser_manga)} шт., батчів: {len(batches)} по {BROWSER_BATCH_SIZE}")
+            batches = list(_chunks(browser_manga, BROWSER_BATCH_SIZE)) if browser_manga else [()]
+
+            if browser_manga:
+                log(f"Браузерні манги: {len(browser_manga)} шт., батчів: {len(batches)} по {BROWSER_BATCH_SIZE}")
+
             for i, batch in enumerate(batches, 1):
-                log(f"  Батч {i}/{len(batches)} ({len(batch)} манг)...")
-                batch_results = await _run_browser_batch(semaphore, session, batch)
+                # Передаємо fallback тільки в останній батч щоб браузер вже точно запущений
+                is_last = (i == len(batches))
+                fb = fallback if is_last else None
+                if browser_manga:
+                    log(f"  Батч {i}/{len(batches)} ({len(batch)} манг)...")
+                batch_results = await _run_browser_batch(semaphore, session, list(batch), fb)
                 results.extend(batch_results)
             return results
 
-        api_results, browser_results = await asyncio.gather(run_api(), run_browser())
+        api_results = await run_api()
 
-    return dict(api_results + browser_results)
+        # Збираємо API манги які повернули "невідомо" - кандидати для fallback
+        def _normalize_fallback_url(url: str) -> str:
+            if "mangalib.me" in url and "chapters" not in url:
+                return url.rstrip("/") + "?section=chapters"
+            return url
+
+        api_failed = [
+            (title, _normalize_fallback_url(api_manga[title]))
+            for title, result in api_results
+            if result == "невідомо"
+        ]
+
+        if api_failed:
+            log(f"  ⚠️ {len(api_failed)} API манг не вдалось — буде спроба через браузер: {[t for t, _ in api_failed]}")
+
+        # Запускаємо браузер (з fallback якщо є невдалі API манги)
+        browser_results = await run_browser(fallback=api_failed if api_failed else None)
+
+        # Результати fallback замінюють оригінальні "невідомо" з API
+        all_results = dict(api_results)
+        all_results.update(dict(browser_results))
+
+    return all_results

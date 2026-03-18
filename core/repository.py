@@ -72,7 +72,7 @@ class MongoRepository(AbstractRepository):
 
     async def load(self) -> dict:
         """Завантажує всі манги і дату перевірки для поточного користувача"""
-        cursor = self.manga_col.find({"user_id": self.user_id})
+        cursor = self.manga_col.find({"user_id": self.user_id}).sort("title", 1).collation({"locale": "uk", "strength": 2})
         manga = {}
         async for doc in cursor:
             manga[doc["title"]] = {
