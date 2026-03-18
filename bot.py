@@ -1,5 +1,5 @@
 """
-Manga Tracker Bot
+Manga Tracker Bot - єдина точка входу.
 
 Команди:
   /start  - меню
@@ -11,7 +11,11 @@ import os
 import signal
 import warnings
 import functools
+import asyncio
 import time
+import datetime
+
+import psutil
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -22,43 +26,80 @@ from telegram.ext import (
 )
 from telegram.warnings import PTBUserWarning
 
-# Заглушуємо PTBUserWarning про CallbackQueryHandler в entry_points
-# per_message=False працює коректно для нашої архітектури
 warnings.filterwarnings("ignore", message=".*CallbackQueryHandler.*", category=PTBUserWarning)
 
 from config.config import TOKEN, CHAT_ID
 from core.repository import get_repository, AbstractRepository
 from core.checker import run_check
 from core.logger import get_logger
+from core.parser_playwright import _shutdown_event
 
 log = get_logger("bot").info
 
+# Час запуску бота і поточний процес для статистики
+_BOT_START_TIME = time.time()
+_process = psutil.Process()
+_process.cpu_percent()  # перший виклик завжди повертає 0.0 - скидається одразу
+_RAM_PEAK_MB: float = 0.0  # відстежується фоновою задачею кожну секунду
+
+def _get_total_ram_mb() -> float:
+    """RAM Python процесу + всі дочірні процеси (Chromium тощо)."""
+    try:
+        total = _process.memory_info().rss
+        for child in _process.children(recursive=True):
+            try:
+                total += child.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return total / 1024 / 1024
+    except Exception:
+        return _process.memory_info().rss / 1024 / 1024
+
+
+async def _memory_monitor():
+    """Фонова задача - кожну секунду оновлює пікове значення RAM."""
+    global _RAM_PEAK_MB
+    while True:
+        try:
+            ram_mb = _get_total_ram_mb()
+            if ram_mb > _RAM_PEAK_MB:
+                _RAM_PEAK_MB = ram_mb
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+
 UNKNOWN_MSG = "Вибач але не можу зрозуміти твого запиту, виклич команду /start для початку роботи."
 
-# TTL кеш для inline пошуку щоб не бити MongoDB на кожен символ
-_MANGA_CACHE: dict = {"data": {}, "updated_at": 0.0}
+# TTL кеш для inline пошуку - щоб не бити MongoDB на кожен символ
+# Структура: {user_id: {"data": {...}, "updated_at": float}}
+_MANGA_CACHE: dict[str, dict] = {}
 _CACHE_TTL = 60  # секунд
 
 
-async def _get_cached_manga(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    """Повертає список манг з кешу, або завантажує з MongoDB якщо кеш застарів."""
+async def _get_cached_manga(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> dict:
+    """Повертає список манг з кешу для user_id, або завантажує з MongoDB якщо кеш застарів."""
     now = time.time()
-    if now - _MANGA_CACHE["updated_at"] > _CACHE_TTL:
-        repo: AbstractRepository = context.bot_data["repo"]
+    entry = _MANGA_CACHE.get(user_id)
+    if not entry or now - entry["updated_at"] > _CACHE_TTL:
+        repo: AbstractRepository = context.bot_data["repos"][user_id]
         data = await repo.load()
-        _MANGA_CACHE["data"] = data.get("manga", {})
-        _MANGA_CACHE["updated_at"] = now
-    return _MANGA_CACHE["data"]
+        _MANGA_CACHE[user_id] = {"data": data.get("manga", {}), "updated_at": now}
+    return _MANGA_CACHE[user_id]["data"]
 
 
-def _invalidate_manga_cache():
-    """Примусово скидає кеш — викликати після додавання або видалення манги."""
-    _MANGA_CACHE["updated_at"] = 0.0
+def _invalidate_manga_cache(user_id: str):
+    """Примусово скидає кеш для user_id - викликати після додавання або видалення манги."""
+    if user_id in _MANGA_CACHE:
+        _MANGA_CACHE[user_id]["updated_at"] = 0.0
 
 
 # Стани діалогів
 ADD_TITLE, ADD_URL = range(2)
 REMOVE_SEARCH, REMOVE_CONFIRM = range(2, 4)
+
+
+# Захист від сторонніх
 
 def _make_owner_guard(conv: bool):
     """Фабрика декораторів захисту від сторонніх.
@@ -78,11 +119,27 @@ def _make_owner_guard(conv: bool):
     return decorator
 
 
-# Для звичайних хендлерів повертає None при відмові
+# Для звичайних хендлерів - повертати None при відмові
 owner_only = _make_owner_guard(conv=False)
 
-# Для entry_points ConversationHandler повертає END при відмові
+# Для entry_points ConversationHandler - повертає END при відмові
 owner_only_conv = _make_owner_guard(conv=True)
+
+# Для адмін-команд - завжди перевіряти тільки CHAT_ID
+def admin_only(func):
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if str(update.effective_user.id) != str(CHAT_ID):
+            if update.callback_query:
+                await update.callback_query.answer("⛔ Немає доступу.", show_alert=True)
+            else:
+                await update.effective_message.reply_text("⛔ Немає доступу.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+# /start
 
 @owner_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,7 +159,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
+
+# Статус з пагінацією
+
 PAGE_SIZE = 10
+
 
 def _build_status_page(manga: dict, last_check: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
     items = list(manga.items())
@@ -111,7 +172,7 @@ def _build_status_page(manga: dict, last_check: str, page: int) -> tuple[str, In
     page = max(0, min(page, total_pages - 1))
     chunk = items[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
-    lines = [f"📚 Манги — {total} шт.\nОстання перевірка: {last_check} — сторінка {page + 1}/{total_pages}\n"]
+    lines = [f"📚 Манги - {total} шт.\nОстання перевірка: {last_check} - сторінка {page + 1}/{total_pages}\n"]
     for title, info in chunk:
         chapter = info.get("last_chapter", "невідомо")
         url = info.get("url", "")
@@ -141,13 +202,16 @@ def _build_status_page(manga: dict, last_check: str, page: int) -> tuple[str, In
 
 
 async def _show_status(message: Message, context: ContextTypes.DEFAULT_TYPE):
-    repo: AbstractRepository = context.bot_data["repo"]
+    repo: AbstractRepository = context.bot_data["repos"][str(message.chat_id)]
     data = await repo.load()
     manga = data.get("manga", {})
     if not manga:
         await message.reply_text("Список манг порожній.")
         return
-    text, keyboard = _build_status_page(manga, data.get("last_check_date", "ніколи"), page=0)
+    # Зберігаємо дані в user_data
+    context.user_data["status_manga"] = manga
+    context.user_data["status_last_check"] = data.get("last_check_date", "ніколи")
+    text, keyboard = _build_status_page(manga, context.user_data["status_last_check"], page=0)
     await message.reply_text(text, reply_markup=keyboard, disable_web_page_preview=True)
 
 
@@ -156,10 +220,17 @@ async def cb_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     page = int(query.data.split(":")[1])
-    repo: AbstractRepository = context.bot_data["repo"]
-    data = await repo.load()
-    manga = data.get("manga", {})
-    text, keyboard = _build_status_page(manga, data.get("last_check_date", "ніколи"), page=page)
+    manga = context.user_data.get("status_manga")
+    last_check = context.user_data.get("status_last_check", "ніколи")
+    if not manga:
+        # Кеш відсутній (наприклад після перезапуску бота) - завантажуємо з БД
+        repo: AbstractRepository = context.bot_data["repos"][str(update.effective_user.id)]
+        data = await repo.load()
+        manga = data.get("manga", {})
+        last_check = data.get("last_check_date", "ніколи")
+        context.user_data["status_manga"] = manga
+        context.user_data["status_last_check"] = last_check
+    text, keyboard = _build_status_page(manga, last_check, page=page)
     await query.edit_message_text(text, reply_markup=keyboard, disable_web_page_preview=True)
 
 
@@ -169,23 +240,31 @@ async def cb_start_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await _show_status(update.effective_message, context)
 
+
+# Перевірка
+
 async def _run_check_command(message: Message, context: ContextTypes.DEFAULT_TYPE):
-    # Захист від паралельного запуску - якщо перевірка вже йде, ігноруємо
+    # Захист від паралельного запуску
     if context.bot_data.get("check_running"):
         await message.reply_text("⏳ Перевірка вже виконується, зачекай...")
         return
     context.bot_data["check_running"] = True
+    user_id = str(message.chat_id)
     try:
-        repo: AbstractRepository = context.bot_data["repo"]
-        # Завантажуємо дані один раз передаємо в run_check щоб уникнути подвійного запиту
+        repo: AbstractRepository = context.bot_data["repos"][user_id]
+        # Завантажуємо дані один раз - передаємо в run_check щоб уникнути подвійного запиту
         data = await repo.load()
         manga = data.get("manga", {})
         if not manga:
             await message.reply_text("Список манг порожній.")
             return
+        ram_before = _get_total_ram_mb()
+        log(f"📊 RAM до перевірки: {ram_before:.1f} MB")
         await message.reply_text(f"🔍 Перевіряю {len(manga)} манг, зачекай...")
         report_text = await run_check(repo=repo, preloaded_data=data)
-        _invalidate_manga_cache()
+        ram_after = _get_total_ram_mb()
+        log(f"📊 RAM після перевірки: {ram_after:.1f} MB | пік сесії: {_RAM_PEAK_MB:.1f} MB")
+        _invalidate_manga_cache(user_id)
         await message.reply_text(report_text, disable_web_page_preview=True)
     finally:
         context.bot_data["check_running"] = False
@@ -198,24 +277,27 @@ async def cb_start_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_check_command(update.effective_message, context)
 
 
+# Діалог: Додати мангу
+
 @owner_only_conv
 async def cb_start_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await update.effective_message.reply_text("Введи назву манги:\n/cancel — скасувати")
+    await update.effective_message.reply_text("Введи назву манги:\n/cancel - скасувати")
     return ADD_TITLE
 
 
 async def add_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = update.effective_message.text.strip()
-    repo: AbstractRepository = context.bot_data["repo"]
+    user_id = str(update.effective_user.id)
+    repo: AbstractRepository = context.bot_data["repos"][user_id]
     data = await repo.load()
     if title in data["manga"]:
         await update.effective_message.reply_text(f"⚠️ «{title}» вже є в списку.")
         return ConversationHandler.END
     context.user_data["add_title"] = title
     await update.effective_message.reply_text(
-        f"Назва: «{title}»\n\nТепер введи URL:\n/cancel — скасувати"
+        f"Назва: «{title}»\n\nТепер введи URL:\n/cancel - скасувати"
     )
     return ADD_URL
 
@@ -233,31 +315,35 @@ async def add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = context.user_data.pop("add_title", None)
     if not title:
         return ConversationHandler.END
-    repo: AbstractRepository = context.bot_data["repo"]
+    user_id = str(update.effective_user.id)
+    repo: AbstractRepository = context.bot_data["repos"][user_id]
     await repo.add_manga(title, url)
-    _invalidate_manga_cache()
+    _invalidate_manga_cache(user_id)
+    context.user_data.pop("status_manga", None)
     await update.effective_message.reply_text(f"✅ «{title}» додано!")
     return ConversationHandler.END
 
+
+# Діалог: Видалити мангу
 
 @owner_only_conv
 async def cb_start_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    repo: AbstractRepository = context.bot_data["repo"]
+    repo: AbstractRepository = context.bot_data["repos"][str(update.effective_user.id)]
     data = await repo.load()
     if not data["manga"]:
         await update.effective_message.reply_text("Список манг порожній.")
         return ConversationHandler.END
     await update.effective_message.reply_text(
-        "Введи назву манги (або частину назви):\n/cancel — скасувати"
+        "Введи назву манги (або частину назви):\n/cancel - скасувати"
     )
     return REMOVE_SEARCH
 
 
 async def remove_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.effective_message.text.strip().lower()
-    repo: AbstractRepository = context.bot_data["repo"]
+    repo: AbstractRepository = context.bot_data["repos"][str(update.effective_user.id)]
     data = await repo.load()
     matches = [t for t in data["manga"] if query_text in t.lower()]
 
@@ -279,7 +365,7 @@ async def remove_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["Знайдено кілька манг, введи номер:"]
     for i, t in enumerate(matches, 1):
         lines.append(f"{i}. {t}")
-    lines.append("\n/cancel — скасувати")
+    lines.append("\n/cancel - скасувати")
     await update.effective_message.reply_text("\n".join(lines))
     return REMOVE_CONFIRM
 
@@ -296,7 +382,6 @@ async def remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text.strip()
     matches = context.user_data.get("remove_matches", [])
 
-    # Якщо matches порожній - значить чекаємо натискання кнопки ✅/❌, а не тексту
     if not matches:
         await update.effective_message.reply_text(
             "⚠️ Натисни кнопку ✅ Так або ❌ Ні, або /cancel для скасування:"
@@ -331,9 +416,11 @@ async def cb_remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("remove_matches", None)
 
     if action == "yes" and pending:
-        repo: AbstractRepository = context.bot_data["repo"]
+        user_id = str(query.from_user.id)
+        repo: AbstractRepository = context.bot_data["repos"][user_id]
         await repo.remove_manga(pending)
-        _invalidate_manga_cache()
+        _invalidate_manga_cache(user_id)
+        context.user_data.pop("status_manga", None)
         await query.edit_message_text(f"🗑 «{pending}» видалено зі списку.")
     else:
         await query.edit_message_text("Скасовано.")
@@ -347,27 +434,32 @@ async def cancel_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Скасовано.")
     return ConversationHandler.END
 
+
+# Невідома команда / текст поза діалогом
+
 @owner_only
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(UNKNOWN_MSG)
 
 
+@owner_only
 async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.via_bot:
-        return
-    if str(update.effective_user.id) != str(CHAT_ID):
         return
     await update.effective_message.reply_text(UNKNOWN_MSG)
 
 
+# Inline пошук
+
 async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query
-    if str(query.from_user.id) != str(CHAT_ID):
+    user_id = str(query.from_user.id)
+    if user_id not in context.bot_data["repos"]:
         await query.answer([], cache_time=0)
         return
 
     query_text = (query.query or "").strip().lower()
-    manga = await _get_cached_manga(context)
+    manga = await _get_cached_manga(context, user_id)
 
     matches = {t: info for t, info in manga.items() if query_text in t.lower()} if query_text else manga
 
@@ -391,8 +483,96 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# /stats helpers
+def _get_stats_process() -> str:
+    global _RAM_PEAK_MB
+    KOYEB_LIMIT_MB = 512
+    ram_mb = _get_total_ram_mb()
+    if ram_mb > _RAM_PEAK_MB:
+        _RAM_PEAK_MB = ram_mb
+    ram_warning = " ⚠️" if ram_mb > KOYEB_LIMIT_MB * 0.8 else ""
+    cpu = _process.cpu_percent(interval=0.5)
+    ram_mb_proc = _process.memory_info().rss / 1024 / 1024
+    uptime = str(datetime.timedelta(seconds=int(time.time() - _BOT_START_TIME)))
+    status = _process.status()
+    return "\n".join([
+        "⚙️ Процес бота",
+        f"  Статус: {status}",
+        f"  RAM (процес): {ram_mb_proc:.1f} MB",
+        f"  RAM (з Chromium): {ram_mb:.1f} MB / ліміт {KOYEB_LIMIT_MB} MB{ram_warning}",
+        f"  RAM пік (з Chromium): {_RAM_PEAK_MB:.1f} MB",
+        f"  CPU: {cpu:.1f}%",
+        f"  Uptime: {uptime}",
+    ])
+
+
+def _get_stats_server() -> str:
+    boot_time = datetime.datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
+    users = psutil.users()
+    users_str = ", ".join(u.name for u in users) if users else "немає"
+    return "\n".join([
+        "🖥 Сервер",
+        f"  Останнє завантаження: {boot_time}",
+        f"  Залогінені користувачі: {users_str}",
+    ])
+
+
+def _get_stats_network() -> str:
+    net = psutil.net_io_counters()
+    try:
+        conns = len([c for c in psutil.net_connections() if c.pid == _process.pid])
+    except psutil.AccessDenied:
+        conns = "н/д"
+    return "\n".join([
+        "🌐 Мережа",
+        f"  Надіслано: {net.bytes_sent / 1024 / 1024:.1f} MB",
+        f"  Отримано: {net.bytes_recv / 1024 / 1024:.1f} MB",
+        f"  Активних з'єднань (процес): {conns}",
+    ])
+
+
+def _stats_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚙️ Процес", callback_data="stats:process"),
+        InlineKeyboardButton("🖥 Сервер", callback_data="stats:server"),
+        InlineKeyboardButton("🌐 Мережа", callback_data="stats:network"),
+    ]])
+
+
+# /stats
+@admin_only
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "📊 Статистика - обери розділ:",
+        reply_markup=_stats_keyboard()
+    )
+
+
+@admin_only
+async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    section = query.data.split(":")[1]
+    if section == "process":
+        text = _get_stats_process()
+    elif section == "server":
+        text = _get_stats_server()
+    else:
+        text = _get_stats_network()
+    try:
+        await query.edit_message_text(text, reply_markup=_stats_keyboard())
+    except Exception:
+        pass
+
+
+# Запуск
+
 def _handle_signal(sig, frame):
-    log(f"⚠️ Отримано сигнал {sig} — завершуємо бота...")
+    log(f"⚠️ Отримано сигнал {sig} - завершуємо бота...")
+    _shutdown_event.set()
     raise SystemExit(0)
 
 
@@ -402,7 +582,7 @@ def run_bot():
 
     repo = get_repository(user_id=CHAT_ID)
     app = ApplicationBuilder().token(TOKEN).build()
-    app.bot_data["repo"] = repo
+    app.bot_data["repos"] = {str(CHAT_ID): repo}
 
     add_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(cb_start_add, pattern=r"^start_add$")],
@@ -428,22 +608,42 @@ def run_bot():
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(add_conv)
     app.add_handler(remove_conv)
     app.add_handler(CallbackQueryHandler(cb_status, pattern=r"^status:"))
+    app.add_handler(CallbackQueryHandler(cb_stats, pattern=r"^stats:"))
     app.add_handler(CallbackQueryHandler(cb_start_status, pattern=r"^start_status$"))
     app.add_handler(CallbackQueryHandler(cb_start_check, pattern=r"^start_check$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_text))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.add_handler(InlineQueryHandler(inline_search))
 
+    async def on_shutdown(app):
+        task = app.bot_data.get("monitor_task")
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        log("🛑 Моніторинг RAM зупинено")
+        for r in app.bot_data["repos"].values():
+            r.close()
+        log("🛑 З'єднання з MongoDB закрито")
+
     async def on_startup(app):
-        await repo.setup()
+        for r in app.bot_data["repos"].values():
+            await r.setup()
         await app.bot.set_my_commands([
             ("start", "Меню"),
+            ("stats", "Статистика сервера"),
         ])
+        app.bot_data["monitor_task"] = asyncio.create_task(_memory_monitor())
+        log("🔍 Фоновий моніторинг RAM запущено")
 
     app.post_init = on_startup
+    app.post_shutdown = on_shutdown
 
     try:
         app.run_polling()
