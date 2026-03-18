@@ -44,6 +44,10 @@ class AbstractRepository(ABC):
     async def set_last_check_date(self, date: str) -> None:
         pass
 
+    @abstractmethod
+    def close(self) -> None:
+        pass
+
 
 class MongoRepository(AbstractRepository):
     """
@@ -114,6 +118,9 @@ class MongoRepository(AbstractRepository):
             upsert=True
         )
 
+    def close(self) -> None:
+        self.client.close()
+
 
 def get_repository(user_id: str | None = None) -> AbstractRepository:
     uri = os.getenv("MONGODB_URI")
@@ -123,7 +130,7 @@ def get_repository(user_id: str | None = None) -> AbstractRepository:
     manga_col = os.getenv("MONGODB_MANGA_COLLECTION", "manga")
     meta_col = os.getenv("MONGODB_META_COLLECTION", "meta")
     if user_id is None:
-        user_id = os.getenv("TELEGRAM_CHAT_ID", "default")
+        raise ValueError("user_id не вказано - передай явно або перевір TELEGRAM_CHAT_ID в .env")
     return MongoRepository(
         uri=uri,
         db_name=db_name,
