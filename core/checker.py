@@ -11,8 +11,21 @@ from core.repository import AbstractRepository
 log = get_logger("checker").info
 
 
+def _normalize_chapter(value: str) -> str:
+    """Нормалізує номер глави до єдиного формату для коректного порівняння.
+
+    "1.0" -> "1", "010" -> "10", "1.5" -> "1.5"
+    "99 extra" -> "99 extra" (не число — повертає stripped оригінал)
+    """
+    try:
+        num = float(value)
+        return str(int(num)) if num == int(num) else str(num)
+    except (ValueError, TypeError):
+        return value.strip()
+
+
 async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None) -> str:
-    # Якщо дані вже завантажені (наприклад з bot.py) не робимо зайвий запит до MongoDB
+    # Якщо дані вже завантажені, не робити зайвий запит до MongoDB
     data = preloaded_data if preloaded_data is not None else await repo.load()
     manga_urls = {title: info["url"] for title, info in data["manga"].items()}
     old_chapters = {title: info["last_chapter"] for title, info in data["manga"].items()}
@@ -27,8 +40,8 @@ async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None
             log(f"  ℹ️ {title} — видалена під час перевірки, пропускаємо")
             continue
 
-        old_chapter = old_chapters.get(title, "невідомо")
-        new_chapter = new_chapter or "невідомо"
+        old_chapter = _normalize_chapter(old_chapters.get(title, "невідомо"))
+        new_chapter = _normalize_chapter(new_chapter) if new_chapter else "невідомо"
         url = data["manga"][title]["url"]
 
         if new_chapter == "невідомо":
@@ -36,6 +49,15 @@ async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None
             continue
 
         if new_chapter != old_chapter:
+            # Якщо обидва числа - нова глава тільки якщо номер більший
+            # Захист від помилкових сповіщень коли сайт повертає некоректний номер
+            try:
+                if float(new_chapter) < float(old_chapter):
+                    log(f"  ⚠️ {title}: нова глава ({new_chapter}) менша за стару ({old_chapter}) — пропускаємо")
+                    continue
+            except (ValueError, TypeError):
+                pass  # нечислові значення ("99 extra") - порівнюємо як рядки, вже перевірили != вище
+
             new_lines.append(f"✅ {title} — нова глава: {new_chapter}  (була: {old_chapter})\n  {url}")
             await repo.update_chapter(title, new_chapter)
 

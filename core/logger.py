@@ -14,7 +14,7 @@ def _setup_logger() -> logging.Logger:
     logger.setLevel(logging.DEBUG)
 
     ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter("%(message)s"))
+    ch.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logger.addHandler(ch)
 
     return logger

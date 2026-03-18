@@ -170,7 +170,7 @@ async def cb_start_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_status(update.effective_message, context)
 
 async def _run_check_command(message: Message, context: ContextTypes.DEFAULT_TYPE):
-    # Захист від паралельного запуску — якщо перевірка вже йде, ігноруємо
+    # Захист від паралельного запуску - якщо перевірка вже йде, ігноруємо
     if context.bot_data.get("check_running"):
         await message.reply_text("⏳ Перевірка вже виконується, зачекай...")
         return
