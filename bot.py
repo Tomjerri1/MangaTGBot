@@ -16,6 +16,7 @@ import time
 import datetime
 
 import psutil
+from aiohttp import web
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,6 +28,8 @@ from telegram.ext import (
 )
 from telegram.warnings import PTBUserWarning
 
+# Заглушуємо PTBUserWarning про CallbackQueryHandler в entry_points
+# per_message=False працює коректно для нашої архітектури
 warnings.filterwarnings("ignore", message=".*CallbackQueryHandler.*", category=PTBUserWarning)
 
 from config.config import TOKEN, CHAT_ID
@@ -37,10 +40,11 @@ from core.parser_playwright import _shutdown_event
 
 log = get_logger("bot").info
 
+# Час запуску бота і поточний процес для статистики
 _BOT_START_TIME = time.time()
 _process = psutil.Process()
-_process.cpu_percent()
-_RAM_PEAK_MB: float = 0.0
+_process.cpu_percent()  # перший виклик завжди повертає 0.0 - скидаємо одразу
+_RAM_PEAK_MB: float = 0.0  # відстежується фоновою задачею кожну секунду
 
 def _get_total_ram_mb() -> float:
     """RAM Python процесу + всі дочірні процеси (Chromium тощо)."""
@@ -125,6 +129,7 @@ owner_only = _make_owner_guard(conv=False)
 # Для entry_points ConversationHandler - повертає END при відмові
 owner_only_conv = _make_owner_guard(conv=True)
 
+# Для адмін-команд - завжди перевіряє тільки CHAT_ID, навіть якщо бот стане публічним
 def admin_only(func):
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -207,6 +212,7 @@ async def _show_status(message: Message, context: ContextTypes.DEFAULT_TYPE):
     if not manga:
         await message.reply_text("Список манг порожній.")
         return
+    # Зберігаємо дані в user_data щоб не йти в MongoDB при кожному гортанні сторінок
     context.user_data["status_manga"] = manga
     context.user_data["status_last_check"] = data.get("last_check_date", "ніколи")
     text, keyboard = _build_status_page(manga, context.user_data["status_last_check"], page=0)
@@ -218,6 +224,7 @@ async def cb_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     page = int(query.data.split(":")[1])
+    # Беремо дані з user_data кешу - MongoDB не потрібна для пагінації
     manga = context.user_data.get("status_manga")
     last_check = context.user_data.get("status_last_check", "ніколи")
     if not manga:
@@ -243,6 +250,7 @@ async def cb_start_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _run_check_command(message: Message, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(message.chat_id)
+    # Захист від паралельного запуску - ізольовано для кожного користувача через user_data
     if context.user_data.get("check_running"):
         await message.reply_text("⏳ Перевірка вже виконується, зачекай...")
         return
@@ -380,7 +388,7 @@ async def remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text.strip()
     matches = context.user_data.get("remove_matches", [])
 
-    # Якщо matches порожній - значить чекаємо натискання кнопки ✅/❌
+    # Якщо matches порожній - значить чекаємо натискання кнопки ✅/❌, а не тексту
     if not matches:
         await update.effective_message.reply_text(
             "⚠️ Натисни кнопку ✅ Так або ❌ Ні, або /cancel для скасування:"
@@ -550,7 +558,7 @@ async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.answer()
     except telegram.error.BadRequest:
-        pass
+        pass  # query протух - ігноруємо, але продовжуємо показувати дані
     section = query.data.split(":")[1]
     if section == "process":
         text = await asyncio.to_thread(_get_stats_process)
@@ -561,7 +569,7 @@ async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.edit_message_text(text, reply_markup=_stats_keyboard())
     except telegram.error.BadRequest:
-        pass
+        pass  # повідомлення не змінилось - ігноруємо
 
 
 # Запуск
@@ -585,14 +593,33 @@ def _handle_signal(sig, frame):
         loop = asyncio.get_running_loop()
         loop.call_soon_threadsafe(_shutdown_event.set)
     except RuntimeError:
-        pass
+        pass  # loop вже мертвий - event.set() не потрібен
     raise SystemExit(0)
+
+
+HEALTH_PORT = int(os.getenv("PORT", "8000"))
+
+
+async def _health(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def _run_health_server():
+    """Легкий HTTP сервер для UptimeRobot - не дає Koyeb засипати."""
+    app = web.Application()
+    app.router.add_get("/health", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+    await site.start()
+    log(f"🌐 Health endpoint запущено на порті {HEALTH_PORT}")
 
 
 def run_bot():
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    # repos - словник репозиторіїв {user_id: repo}, розширюється при додаванні нових користувачів
     repo = get_repository(user_id=CHAT_ID)
     app = ApplicationBuilder().token(TOKEN).build()
     app.bot_data["repos"] = {str(CHAT_ID): repo}
@@ -634,13 +661,14 @@ def run_bot():
     app.add_error_handler(error_handler)
 
     async def on_shutdown(app):
-        task = app.bot_data.get("monitor_task")
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for task_key in ("monitor_task", "health_task"):
+            task = app.bot_data.get(task_key)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         log("🛑 Моніторинг RAM зупинено")
         for r in app.bot_data["repos"].values():
             r.close()
@@ -655,6 +683,7 @@ def run_bot():
         ])
         app.bot_data["monitor_task"] = asyncio.create_task(_memory_monitor())
         log("🔍 Фоновий моніторинг RAM запущено")
+        app.bot_data["health_task"] = asyncio.create_task(_run_health_server())
 
     app.post_init = on_startup
     app.post_shutdown = on_shutdown
