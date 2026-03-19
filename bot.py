@@ -19,6 +19,7 @@ import psutil
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import telegram
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -36,11 +37,10 @@ from core.parser_playwright import _shutdown_event
 
 log = get_logger("bot").info
 
-# Час запуску бота і поточний процес для статистики
 _BOT_START_TIME = time.time()
 _process = psutil.Process()
-_process.cpu_percent()  # перший виклик завжди повертає 0.0 - скидається одразу
-_RAM_PEAK_MB: float = 0.0  # відстежується фоновою задачею кожну секунду
+_process.cpu_percent()
+_RAM_PEAK_MB: float = 0.0
 
 def _get_total_ram_mb() -> float:
     """RAM Python процесу + всі дочірні процеси (Chromium тощо)."""
@@ -57,16 +57,16 @@ def _get_total_ram_mb() -> float:
 
 
 async def _memory_monitor():
-    """Фонова задача - кожну секунду оновлює пікове значення RAM."""
+    """Фонова задача - кожні 5 секунд оновлює пікове значення RAM."""
     global _RAM_PEAK_MB
     while True:
         try:
-            ram_mb = _get_total_ram_mb()
+            ram_mb = await asyncio.to_thread(_get_total_ram_mb)
             if ram_mb > _RAM_PEAK_MB:
                 _RAM_PEAK_MB = ram_mb
-        except Exception:
-            pass
-        await asyncio.sleep(1)
+        except Exception as e:
+            log(f"⚠️ Моніторинг RAM: помилка вимірювання: {e}")
+        await asyncio.sleep(5)
 
 
 UNKNOWN_MSG = "Вибач але не можу зрозуміти твого запиту, виклич команду /start для початку роботи."
@@ -119,13 +119,12 @@ def _make_owner_guard(conv: bool):
     return decorator
 
 
-# Для звичайних хендлерів - повертати None при відмові
+# Для звичайних хендлерів - повертає None при відмові
 owner_only = _make_owner_guard(conv=False)
 
 # Для entry_points ConversationHandler - повертає END при відмові
 owner_only_conv = _make_owner_guard(conv=True)
 
-# Для адмін-команд - завжди перевіряти тільки CHAT_ID
 def admin_only(func):
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -208,7 +207,6 @@ async def _show_status(message: Message, context: ContextTypes.DEFAULT_TYPE):
     if not manga:
         await message.reply_text("Список манг порожній.")
         return
-    # Зберігаємо дані в user_data
     context.user_data["status_manga"] = manga
     context.user_data["status_last_check"] = data.get("last_check_date", "ніколи")
     text, keyboard = _build_status_page(manga, context.user_data["status_last_check"], page=0)
@@ -244,12 +242,11 @@ async def cb_start_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Перевірка
 
 async def _run_check_command(message: Message, context: ContextTypes.DEFAULT_TYPE):
-    # Захист від паралельного запуску
-    if context.bot_data.get("check_running"):
+    user_id = str(message.chat_id)
+    if context.user_data.get("check_running"):
         await message.reply_text("⏳ Перевірка вже виконується, зачекай...")
         return
-    context.bot_data["check_running"] = True
-    user_id = str(message.chat_id)
+    context.user_data["check_running"] = True
     try:
         repo: AbstractRepository = context.bot_data["repos"][user_id]
         # Завантажуємо дані один раз - передаємо в run_check щоб уникнути подвійного запиту
@@ -265,9 +262,10 @@ async def _run_check_command(message: Message, context: ContextTypes.DEFAULT_TYP
         ram_after = _get_total_ram_mb()
         log(f"📊 RAM після перевірки: {ram_after:.1f} MB | пік сесії: {_RAM_PEAK_MB:.1f} MB")
         _invalidate_manga_cache(user_id)
+        context.user_data.pop("status_manga", None)
         await message.reply_text(report_text, disable_web_page_preview=True)
     finally:
-        context.bot_data["check_running"] = False
+        context.user_data.pop("check_running", None)
 
 
 @owner_only
@@ -382,6 +380,7 @@ async def remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text.strip()
     matches = context.user_data.get("remove_matches", [])
 
+    # Якщо matches порожній - значить чекаємо натискання кнопки ✅/❌
     if not matches:
         await update.effective_message.reply_text(
             "⚠️ Натисни кнопку ✅ Так або ❌ Ні, або /cancel для скасування:"
@@ -485,11 +484,8 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # /stats helpers
 def _get_stats_process() -> str:
-    global _RAM_PEAK_MB
     KOYEB_LIMIT_MB = 512
     ram_mb = _get_total_ram_mb()
-    if ram_mb > _RAM_PEAK_MB:
-        _RAM_PEAK_MB = ram_mb
     ram_warning = " ⚠️" if ram_mb > KOYEB_LIMIT_MB * 0.8 else ""
     cpu = _process.cpu_percent(interval=0.5)
     ram_mb_proc = _process.memory_info().rss / 1024 / 1024
@@ -553,26 +549,43 @@ async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
         await query.answer()
-    except Exception:
+    except telegram.error.BadRequest:
         pass
     section = query.data.split(":")[1]
     if section == "process":
-        text = _get_stats_process()
+        text = await asyncio.to_thread(_get_stats_process)
     elif section == "server":
-        text = _get_stats_server()
+        text = await asyncio.to_thread(_get_stats_server)
     else:
-        text = _get_stats_network()
+        text = await asyncio.to_thread(_get_stats_network)
     try:
         await query.edit_message_text(text, reply_markup=_stats_keyboard())
-    except Exception:
+    except telegram.error.BadRequest:
         pass
 
 
 # Запуск
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log(f"❌ Необроблена помилка: {context.error}")
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("⚠️ Сталась помилка, спробуй ще раз.")
+        except Exception as e:
+            log(f"⚠️ error_handler: не вдалось надіслати повідомлення: {e}")
+    if isinstance(update, Update) and update.callback_query:
+        try:
+            await update.callback_query.answer("⚠️ Сталась помилка.", show_alert=True)
+        except Exception as e:
+            log(f"⚠️ error_handler: не вдалось відповісти на callback: {e}")
+
 def _handle_signal(sig, frame):
     log(f"⚠️ Отримано сигнал {sig} - завершуємо бота...")
-    _shutdown_event.set()
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(_shutdown_event.set)
+    except RuntimeError:
+        pass
     raise SystemExit(0)
 
 
@@ -618,6 +631,7 @@ def run_bot():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_text))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.add_handler(InlineQueryHandler(inline_search))
+    app.add_error_handler(error_handler)
 
     async def on_shutdown(app):
         task = app.bot_data.get("monitor_task")
