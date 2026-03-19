@@ -72,7 +72,7 @@ def register_parser(domain: str):
 #Regex
 
 _CHAPTER_RE = re.compile(
-    r"(?:Глава|Розділ|Chapter)\s*(\d+(?:\.\d+)?)",
+    r"(?:Глава|Розділ|Chapter|Гл(?:ава)?\.?|Ch(?:apter)?\.?|Р(?:озділ)?\.?)\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE
 )
 
@@ -124,7 +124,7 @@ def _extract_comx_chapters(html: str) -> list[int]:
     try:
         data = json.loads(m.group(1))
         return [ch["posi"] for ch in data.get("chapters", []) if ch.get("posi")]
-    except Exception:
+    except (json.JSONDecodeError, KeyError):
         nums = re.findall(r'"posi"\s*:\s*(\d+)', m.group(1))
         return [int(n) for n in nums]
 
@@ -379,7 +379,7 @@ async def _parse_mangalib_browser(page: Page, url: str) -> str:
     try:
         await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
-        pass  # якщо networkidle не досягнуто за 15с - продовжувати з тим що є
+        pass
     try:
         await page.wait_for_selector("a[href*='/read/']", timeout=20000)
     except Exception:
@@ -572,7 +572,11 @@ async def check_all(manga_dict: dict) -> dict[str, str]:
 
             async def _limited(title, url):
                 async with api_semaphore:
-                    return await _check_one_api(session, title, url)
+                    try:
+                        return await _check_one_api(session, title, url)
+                    except Exception as e:
+                        log(f"  ❌ Глобальна помилка API для {title}: {e}")
+                        return title, "невідомо"
 
             tasks = [_limited(title, url) for title, url in api_manga.items()]
             return list(await asyncio.gather(*tasks))
@@ -601,7 +605,6 @@ async def check_all(manga_dict: dict) -> dict[str, str]:
 
         api_results = await run_api()
 
-        # Збирає API манги які повернули "невідомо" - кандидати для браузерного fallback
         api_failed = [
             (title, api_manga[title])
             for title, result in api_results
@@ -611,7 +614,6 @@ async def check_all(manga_dict: dict) -> dict[str, str]:
         if api_failed:
             log(f"  ⚠️ {len(api_failed)} API манг не вдалось - буде спроба через браузер: {[t for t, _ in api_failed]}")
 
-        # Запускає браузер (з fallback якщо є невдалі API манги)
         browser_results = await run_browser(fallback=api_failed if api_failed else None)
 
         all_results = dict(api_results)
