@@ -19,6 +19,9 @@ MAX_CONCURRENT_API = int(os.getenv("MAX_CONCURRENT_API", "5"))
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "120"))
 BROWSER_BATCH_SIZE = int(os.getenv("BROWSER_BATCH_SIZE", "10"))
 
+
+_PROXY_URL = os.getenv("PROXY_URL")
+
 log = get_logger("parser").info
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -103,7 +106,7 @@ def retry(times: int = 3, delay: float = 2.0):
                 except Exception as e:
                     last_error = e
                     if _shutdown_event.is_set():
-                        log(f"  ⚠️ Зупинка бота - перериваємо retry для {url}")
+                        log(f"  ⚠️ Зупинка бота — перериваємо retry для {url}")
                         return "невідомо"
                     if attempt < times:
                         log(f"  ⚠️ Спроба {attempt}/{times} невдала: {e}. Повтор через {delay}с...")
@@ -241,6 +244,7 @@ async def _parse_mangainua_api(url: str, session: aiohttp.ClientSession) -> str 
             ) as r:
                 r.raise_for_status()
                 html = await r.text()
+                # Фікс: regex з ASCII лапками (одинарна і подвійна)
                 hash_match = re.search(
                     r"""site_login_hash\s*=\s*['"]([a-f0-9]{32,64})['"]""", html
                 )
@@ -249,6 +253,7 @@ async def _parse_mangainua_api(url: str, session: aiohttp.ClientSession) -> str 
                     return None
                 site_login_hash = hash_match.group(1)
 
+            #POST load_chapters - cookies з кроку 1 вже в manga_session
             async with manga_session.post(
                 "https://manga.in.ua/engine/ajax/controller.php",
                 data={
@@ -328,7 +333,7 @@ async def _parse_comx(page, url: str) -> str:
         log(f"  ✅ [browser] com-x.life: {result}")
         return result
     sample = await _sample_links(page)
-    log(f"  ❌ com-x.life: window.__DATA__ не знайдено - сайт міг змінити структуру ({url})")
+    log(f"  ❌ com-x.life: window.__DATA__ не знайдено — сайт міг змінити структуру ({url})")
     log(f"     Зразок посилань на сторінці: {sample}")
     raise Exception("главу не знайдено")
 
@@ -372,14 +377,15 @@ async def _parse_mangabuff(page, url: str) -> str:
 @register_parser("mangalib.me")
 @retry(times=3, delay=2.0)
 async def _parse_mangalib_browser(page: Page, url: str) -> str:
-    """Браузерний парсер для mangalib.me - API закритий, використовуємо Playwright."""
+    """Браузерний парсер для mangalib.me — API закритий, використовуємо Playwright."""
+    # Додаємо ?section=chapters якщо немає — без нього список глав не відображається
     if "section=chapters" not in url:
         url = url.rstrip("/") + "?section=chapters"
     await page.goto(url, timeout=40000, wait_until="domcontentloaded")
     try:
         await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
-        pass
+        pass  # якщо networkidle не досягнуто за 15с — продовжуємо з тим що є
     try:
         await page.wait_for_selector("a[href*='/read/']", timeout=20000)
     except Exception:
@@ -452,7 +458,7 @@ async def _check_one_api(
         parser_func = _parse_mangainua_api
 
     if parser_func is None:
-        log(f"  ❌ {title} - невідомий API домен")
+        log(f"  ❌ {title} — невідомий API домен")
         return title, "невідомо"
 
     result = await parser_func(url, session)
@@ -472,7 +478,7 @@ async def _check_one(
     try:
         result = await _check_one_browser(semaphore, context, title, url)
     except Exception as e:
-        log(f"  ❌ {title} - помилка: {e}")
+        log(f"  ❌ {title} — помилка: {e}")
         result = "невідомо"
     return title, result
 
@@ -520,9 +526,11 @@ async def _run_browser_batch(
     batch: list[tuple[str, str]],
 ) -> list[tuple[str, str]]:
     """Запускає один браузер для батчу манг, закриває після завершення."""
+    proxy = {"server": _PROXY_URL} if _PROXY_URL else None
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
+            proxy=proxy,
             args=[
                 "--disable-gpu",
                 "--disable-dev-shm-usage",
@@ -605,6 +613,7 @@ async def check_all(manga_dict: dict) -> dict[str, str]:
 
         api_results = await run_api()
 
+        # Збираємо API манги які повернули "невідомо" - кандидати для браузерного fallback
         api_failed = [
             (title, api_manga[title])
             for title, result in api_results
@@ -612,10 +621,12 @@ async def check_all(manga_dict: dict) -> dict[str, str]:
         ]
 
         if api_failed:
-            log(f"  ⚠️ {len(api_failed)} API манг не вдалось - буде спроба через браузер: {[t for t, _ in api_failed]}")
+            log(f"  ⚠️ {len(api_failed)} API манг не вдалось — буде спроба через браузер: {[t for t, _ in api_failed]}")
 
+        # Запускаємо браузер (з fallback якщо є невдалі API манги)
         browser_results = await run_browser(fallback=api_failed if api_failed else None)
 
+        # Результати fallback замінюють оригінальні "невідомо" з API
         all_results = dict(api_results)
         all_results.update(dict(browser_results))
 
