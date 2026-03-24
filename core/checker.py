@@ -3,6 +3,7 @@
 Використовує Dependency Injection через AbstractRepository.
 """
 from datetime import datetime
+import time
 
 from core.parser_playwright import check_all
 from core.logger import get_logger
@@ -25,6 +26,7 @@ def _normalize_chapter(value: str) -> str:
 
 
 async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None) -> str:
+    _start = time.monotonic()
     # Якщо дані вже завантажені, не робити зайвий запит до MongoDB
     data = preloaded_data if preloaded_data is not None else await repo.load()
     manga_urls = {title: info["url"] for title, info in data["manga"].items()}
@@ -75,4 +77,6 @@ async def run_check(repo: AbstractRepository, preloaded_data: dict | None = None
         report_lines.append("")
         report_lines.extend(error_lines)
 
+    elapsed = time.monotonic() - _start
+    log(f"⏱ Перевірка завершена за {elapsed:.1f} сек")
     return "\n".join(report_lines)
